@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- Last updated: Dec 29, 2025 -->
 
 # zkSecureDNA
 

@@ -10022,6 +10022,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "zk_cli"
+version = "1.0.8"
+dependencies = [
+ "anyhow",
+ "clap",
+ "curve25519-dalek",
+ "hex",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zk_escrow",
+ "zk_prover",
+ "zk_types",
+]
+
+[[package]]
 name = "zk_escrow"
 version = "1.0.8"
 dependencies = [

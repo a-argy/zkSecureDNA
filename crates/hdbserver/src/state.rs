@@ -42,7 +42,7 @@ pub struct HdbServerState {
 
 pub struct ZkState {
     pub verifier: zk_prover::ScreeningVerifier,
-    pub trusted_active_security_key: Option<zk_prover::zk_types::Digest32>,
+    pub trusted_active_security_key: zk_prover::zk_types::Digest32,
 }
 
 impl HdbServerState {

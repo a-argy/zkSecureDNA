@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use curve25519_dalek::scalar::Scalar;
 use doprf::active_security::{commitments_from_secret_and_keyshares, ActiveSecurityKey};
+use doprf::dleq::{keyserve_domain, DleqProof};
 use doprf::party::{KeyserverId, KeyserverIdSet};
 use doprf::prf::{generate_keyshares, HashPart, KeyShare, QueryStateSet};
 use doprf::tagged::{HashTag, TaggedHash};
@@ -59,7 +60,9 @@ async fn main() -> anyhow::Result<()> {
             REQUIRED as usize,
             ask.clone(),
         );
-        let responses: Vec<(KeyserverId, PackedRistrettos<HashPart>)> = chosen
+        let id_list: Vec<u32> = ids.iter().map(u32::from).collect();
+        let queries: Vec<[u8; 32]> = qs.queries().map(|q| *q.as_bytes()).collect();
+        let responses: Vec<(KeyserverId, PackedRistrettos<HashPart>, DleqProof)> = chosen
             .iter()
             .map(|(id, share)| {
                 let coeff = ids.langrange_coefficient_for_id(id);
@@ -67,7 +70,11 @@ async fn main() -> anyhow::Result<()> {
                     .queries()
                     .map(|q| share.apply_query_and_lagrange_coefficient(*q, &coeff))
                     .collect();
-                (*id, parts.into_iter().collect())
+                let part_bytes: Vec<[u8; 32]> = parts.iter().map(|p| *p.as_bytes()).collect();
+                let proof = share
+                    .prove_responses(&coeff, &keyserve_domain(u32::from(id), &id_list), &queries, &part_bytes)
+                    .unwrap();
+                (*id, parts.into_iter().collect(), proof)
             })
             .collect();
 
@@ -80,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         let proof_bytes = proof.proof.expect("prove mode yields a proof");
 
         let mut done = qs.clone();
-        for (id, packed) in &responses {
+        for (id, packed, _) in &responses {
             let parts: Vec<HashPart> = packed.iter_decoded().collect::<Result<_, _>>()?;
             done.incorporate_response(*id, &parts)?;
         }

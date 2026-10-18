@@ -234,7 +234,10 @@ async fn test_hdb() {
         // With ZK_PROOF_MODE=prove (and the `zk` feature), screening goes
         // through /scep/screen-and-verify, so the HDB must verify.
         zk_verify: std::env::var("ZK_PROOF_MODE").as_deref() == Ok("prove"),
-        zk_active_security_key_digest: None,
+        zk_active_security_key_digest: Some(hex::encode(zk_types::active_security_key_digest(
+            &doprf::active_security::ActiveSecurityKey::from_commitments(active_security_key.clone())
+                .commitment_bytes(),
+        ))),
     };
     let server_config = Arc::new(ServerConfig {
         main: PlaneConfig {

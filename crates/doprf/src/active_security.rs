@@ -76,6 +76,12 @@ impl ActiveSecurityKey {
         self.0.iter().map(|c| c.compress().to_bytes()).collect()
     }
 
+    /// Public key `keyshare_id * G` of a keyserver, interpolated from the
+    /// commitments. Used to verify keyserver DLEQ proofs.
+    pub fn keyserver_public_key(&self, id: &KeyserverId) -> RistrettoPoint {
+        evaluate_lagrange_polynomial(&self.0, id.into())
+    }
+
     /// The active security key supports a quorum that is equal to the number of commitments it holds internally
     pub fn supported_quorum(&self) -> u32 {
         self.0.len() as u32
@@ -283,6 +289,11 @@ impl RandomizedTarget {
     /// Compressed public commitments, for digesting into zk statements.
     pub fn commitment_bytes(&self) -> Vec<[u8; 32]> {
         self.commitments.iter().map(|c| c.compress().to_bytes()).collect()
+    }
+
+    /// See [`ActiveSecurityKey::keyserver_public_key`].
+    pub fn keyserver_public_key(&self, id: &KeyserverId) -> RistrettoPoint {
+        evaluate_lagrange_polynomial(&self.commitments, id.into())
     }
 
     pub fn get_checksum_point_for_validation(&self, point_sum: &RistrettoPoint) -> RistrettoPoint {

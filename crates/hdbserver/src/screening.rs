@@ -90,6 +90,17 @@ pub async fn scep_endpoint_screen_and_verify(
     check_content_type(request.headers(), zk_prover::zk_types::SCREEN_AND_VERIFY_CONTENT_TYPE)
         .map_err(|e| invalid(e.into()))?;
 
+    // Proof verification is expensive: only do it for an authenticated
+    // session, and under the same heavy-request throttle as screening.
+    let cookie = scep_server_helpers::request::get_session_cookie(request.headers())?;
+    if !hdbs_state.scep.clients.read().await.has_session(&cookie) {
+        return Err(invalid(anyhow::anyhow!("unknown cookie {cookie}")));
+    }
+    let verify_permit = match hdbs_state.throttle_heavy_requests() {
+        Ok(permit) => permit,
+        Err(err_response) => return Ok(err_response),
+    };
+
     let (mut parts, body) = request.into_parts();
     let body = http_body_util::Limited::new(body, MAX_SCREEN_AND_VERIFY_BODY)
         .collect()
@@ -107,7 +118,7 @@ pub async fn scep_endpoint_screen_and_verify(
         zk.verifier.verify(
             &proof,
             &hashes_for_verify,
-            zk.trusted_active_security_key.as_ref(),
+            Some(&zk.trusted_active_security_key),
         )
     })
     .await
@@ -116,6 +127,7 @@ pub async fn scep_endpoint_screen_and_verify(
         warn!("{request_id}: rejected zk proof: {e}");
         invalid(e.into())
     })?;
+    drop(verify_permit);
     info!(
         "{request_id}: zk proof verified (order commitment {})",
         hex::encode(statement.order_commitment)
@@ -126,8 +138,46 @@ pub async fn scep_endpoint_screen_and_verify(
         hyper::header::CONTENT_TYPE,
         hyper::header::HeaderValue::from_static(TaggedHash::CONTENT_TYPE),
     );
+    let hdb_hashes_digest = statement.hdb_hashes_digest;
+    let statement_digest = zk_prover::zk_types::statement_digest(&statement);
     let request = Request::from_parts(parts, http_body_util::Full::new(hashes));
-    scep_endpoint_screen(request_id, hdbs_state, request).await
+    let keypair = hdbs_state.scep.keypair.clone();
+    let response = scep_endpoint_screen(request_id, hdbs_state, request).await?;
+    if response.status() != StatusCode::OK {
+        return Ok(response);
+    }
+
+    // Attest to what was screened and the outcome, so the lab can show a
+    // third party (or the on-chain registry) what the HDB told it.
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| invalid(e.context("collecting screening result")))?
+        .to_bytes();
+    let result: HdbScreeningResult = serde_json::from_slice(&body)
+        .map_err(|e| invalid(anyhow::anyhow!("decoding screening result: {e}")))?;
+    let attestation = zk_prover::zk_types::HdbAttestation {
+        statement_digest,
+        hdb_hashes_digest,
+        hazard_count: result.results.len() as u32,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default(),
+        hdb_public_key: keypair.public_key().to_bytes(),
+    };
+    let signature = keypair.sign(&attestation.message());
+    let response = zk_prover::zk_types::ScreenAndVerifyResponse {
+        result,
+        attestation: zk_prover::zk_types::SignedHdbAttestation {
+            attestation,
+            signature: signature.to_bytes().to_vec(),
+        },
+    };
+    let json = serde_json::to_string(&response)
+        .map_err(|e| invalid(anyhow::anyhow!("encoding response: {e}")))?;
+    Ok(response::json(StatusCode::OK, json))
 }
 
 pub async fn scep_endpoint_screen<B>(

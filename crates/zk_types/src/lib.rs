@@ -144,3 +144,79 @@ pub fn decode_screen_and_verify(body: &[u8]) -> Option<(&[u8], &[u8])> {
     }
     Some(rest.split_at(len))
 }
+
+/// Digest of a [`ScreeningStatement`], field by field (no serializer
+/// dependence), so it can be recomputed anywhere, including in Solidity.
+pub fn statement_digest(s: &ScreeningStatement) -> Digest32 {
+    let mut h = Sha256::new();
+    h.update(b"zksecuredna/statement/v1");
+    for w in s.hash_vkey.iter().chain(&s.checksum_vkey) {
+        h.update(w.to_le_bytes());
+    }
+    h.update(s.order_commitment);
+    h.update(s.queries_digest);
+    h.update(s.responses_digest);
+    h.update((s.keyserver_ids.len() as u32).to_le_bytes());
+    for id in &s.keyserver_ids {
+        h.update(id.to_le_bytes());
+    }
+    h.update(s.active_security_key_digest);
+    h.update(s.hdb_hashes_digest);
+    h.finalize().into()
+}
+
+/// What the HDB signs after verifying a screening proof and screening the
+/// hashes (Ed25519, with its SCEP keypair).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HdbAttestation {
+    pub statement_digest: Digest32,
+    pub hdb_hashes_digest: Digest32,
+    /// Number of hazard hits the HDB found (0 = nothing flagged).
+    pub hazard_count: u32,
+    /// Unix seconds when the HDB screened the order.
+    pub timestamp: u64,
+    pub hdb_public_key: Digest32,
+}
+
+impl HdbAttestation {
+    /// The exact bytes signed.
+    pub fn message(&self) -> Vec<u8> {
+        let mut m = Vec::with_capacity(24 + 32 * 3 + 4 + 8 + 32);
+        m.extend_from_slice(b"zksecuredna/hdb-attestation/v1");
+        m.extend_from_slice(&self.statement_digest);
+        m.extend_from_slice(&self.hdb_hashes_digest);
+        m.extend_from_slice(&self.hazard_count.to_le_bytes());
+        m.extend_from_slice(&self.timestamp.to_le_bytes());
+        m.extend_from_slice(&self.hdb_public_key);
+        m
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedHdbAttestation {
+    pub attestation: HdbAttestation,
+    /// 64-byte Ed25519 signature over [`HdbAttestation::message`].
+    pub signature: Vec<u8>,
+}
+
+/// Response body of `/scep/screen-and-verify`. `R` is the usual
+/// `HdbScreeningResult`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenAndVerifyResponse<R> {
+    pub result: R,
+    pub attestation: SignedHdbAttestation,
+}
+
+/// Everything a lab keeps after a proved screening, to later build the
+/// on-chain record. Private: contains the windows and the commitment salt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZkReceipt {
+    pub statement: ScreeningStatement,
+    /// bincode-encoded compressed aggregation proof.
+    pub proof: Vec<u8>,
+    /// Opening salt for `statement.order_commitment`.
+    pub salt: Digest32,
+    pub attestation: SignedHdbAttestation,
+    /// The screened windows, in order (opens the order commitment).
+    pub windows: Vec<Vec<u8>>,
+}

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use doprf::active_security::ActiveSecurityKey;
 use doprf::party::KeyserverId;
+use doprf::dleq::DleqProof;
 use doprf::prf::{HashPart, QueryWitness, SerializableQueryStateSet};
 use packed_ristretto::PackedRistrettos;
 use rand::RngCore;
@@ -189,7 +190,7 @@ impl ClientProver {
         mode: ProofMode,
         query_proofs: QueryProofs,
         querystate: &SerializableQueryStateSet,
-        keyserver_responses: &[(KeyserverId, PackedRistrettos<HashPart>)],
+        keyserver_responses: &[(KeyserverId, PackedRistrettos<HashPart>, DleqProof)],
     ) -> anyhow::Result<ScreeningProof> {
         let start = Instant::now();
         let QueryProofs { hash, checksum, salt, mut timings } = query_proofs;

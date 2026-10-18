@@ -10,6 +10,7 @@ use std::num::NonZeroU32;
 
 use curve25519_dalek::scalar::Scalar;
 use doprf::active_security::{commitments_from_secret_and_keyshares, ActiveSecurityKey};
+use doprf::dleq::{keyserve_domain, DleqProof};
 use doprf::party::{KeyserverId, KeyserverIdSet};
 use doprf::prf::{generate_keyshares, HashPart, KeyShare, QueryStateSet, QueryWitness};
 use doprf::tagged::{HashTag, TaggedHash};
@@ -19,6 +20,30 @@ use zk_prover::{ClientProver, ProofMode, ScreeningVerifier, VerifyError};
 use zk_types::{concat, hdb_hashes_digest};
 
 const REQUIRED: u32 = 2;
+
+type Response = (KeyserverId, PackedRistrettos<HashPart>, DleqProof);
+
+/// What a keyserver holding `share` returns, as `/scep/keyserve-proved` does.
+fn respond_with(chosen: &[(KeyserverId, KeyShare)], qs: &QueryStateSet) -> Vec<Response> {
+    let ids: KeyserverIdSet = chosen.iter().map(|(id, _)| *id).collect();
+    let id_list: Vec<u32> = ids.iter().map(u32::from).collect();
+    let queries: Vec<[u8; 32]> = qs.queries().map(|q| *q.as_bytes()).collect();
+    chosen
+        .iter()
+        .map(|(id, share)| {
+            let coeff = ids.langrange_coefficient_for_id(id);
+            let parts: Vec<HashPart> = qs
+                .queries()
+                .map(|q| share.apply_query_and_lagrange_coefficient(*q, &coeff))
+                .collect();
+            let part_bytes: Vec<[u8; 32]> = parts.iter().map(|p| *p.as_bytes()).collect();
+            let proof = share
+                .prove_responses(&coeff, &keyserve_domain(u32::from(id), &id_list), &queries, &part_bytes)
+                .unwrap();
+            (*id, parts.into_iter().collect(), proof)
+        })
+        .collect()
+}
 
 struct Keyservers {
     ask: ActiveSecurityKey,
@@ -42,20 +67,9 @@ impl Keyservers {
         Self { ask, chosen }
     }
 
-    /// Honest responses from each chosen keyserver.
-    fn respond(&self, qs: &QueryStateSet) -> Vec<(KeyserverId, PackedRistrettos<HashPart>)> {
-        let ids: KeyserverIdSet = self.chosen.iter().map(|(id, _)| *id).collect();
-        self.chosen
-            .iter()
-            .map(|(id, share)| {
-                let coeff = ids.langrange_coefficient_for_id(id);
-                let parts: Vec<HashPart> = qs
-                    .queries()
-                    .map(|q| share.apply_query_and_lagrange_coefficient(*q, &coeff))
-                    .collect();
-                (*id, parts.into_iter().collect())
-            })
-            .collect()
+    /// Honest responses (with DLEQ proofs) from each chosen keyserver.
+    fn respond(&self, qs: &QueryStateSet) -> Vec<Response> {
+        respond_with(&self.chosen, qs)
     }
 
     fn queries(&self, windows: &[&str]) -> (QueryStateSet, QueryWitness) {
@@ -79,7 +93,7 @@ const WINDOWS: [&str; 3] = [
 
 fn local_hashes_digest(qs: &QueryStateSet, ks: &Keyservers) -> [u8; 32] {
     let mut qs = qs.clone();
-    for (id, packed) in ks.respond(&qs) {
+    for (id, packed, _) in ks.respond(&qs) {
         let parts: Vec<HashPart> = packed.iter_decoded().map(Result::unwrap).collect();
         qs.incorporate_response(id, &parts).unwrap();
     }
@@ -147,12 +161,53 @@ async fn rejects_cheating_keyserver() {
     let mut parts: Vec<HashPart> = responses[1].1.iter_decoded().map(Result::unwrap).collect();
     parts[0] = parts[1];
     responses[1].1 = parts.into_iter().collect();
+    // (Its DLEQ proof no longer matches either; both checks must reject.)
 
     let query_proofs = prover.prove_queries(ProofMode::Execute, &witness, &ks.ask).await.unwrap();
     let result = prover
         .prove_screening(ProofMode::Execute, query_proofs, &qs.to_serializable_set(), &responses)
         .await;
     assert!(result.is_err(), "active security must catch a wrong keyserver response");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejects_impostor_keyserver() {
+    let prover = ClientProver::new().await.unwrap();
+    let ks = Keyservers::new();
+    let (qs, witness) = ks.queries(&WINDOWS);
+
+    // Keyserver 2 is replaced by someone with a different keyshare, who
+    // answers consistently and proves honestly against their own key.
+    let impostor = KeyShare::from(Scalar::random(&mut OsRng));
+    let chosen = vec![ks.chosen[0].clone(), (ks.chosen[1].0, impostor)];
+    let responses = respond_with(&chosen, &qs);
+
+    let query_proofs = prover.prove_queries(ProofMode::Execute, &witness, &ks.ask).await.unwrap();
+    let result = prover
+        .prove_screening(ProofMode::Execute, query_proofs, &qs.to_serializable_set(), &responses)
+        .await;
+    assert!(result.is_err(), "responses must come from the published keyshares");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_run_keyservers_yield_a_different_key_digest() {
+    // A lab that generates its own key and plays every keyserver can make a
+    // valid proof, but it commits to the lab's key, which an HDB pinning the
+    // real active-security key rejects (see the prove-mode verifier test).
+    let prover = ClientProver::new().await.unwrap();
+    let real = Keyservers::new();
+    let fake = Keyservers::new();
+    let (qs, witness) = fake.queries(&WINDOWS);
+
+    let query_proofs = prover.prove_queries(ProofMode::Execute, &witness, &fake.ask).await.unwrap();
+    let proof = prover
+        .prove_screening(ProofMode::Execute, query_proofs, &qs.to_serializable_set(), &fake.respond(&qs))
+        .await
+        .unwrap();
+    assert_ne!(
+        proof.statement.active_security_key_digest,
+        zk_types::active_security_key_digest(&real.ask.commitment_bytes())
+    );
 }
 
 /// Real proofs: the HDB verifier accepts an honest proof and rejects proofs
@@ -174,7 +229,7 @@ async fn verifier_accepts_honest_and_rejects_mismatched_proofs() {
 
     // Rebuild exactly the bytes the client would post to the HDB.
     let mut qs_done = qs.clone();
-    for (id, packed) in ks.respond(&qs) {
+    for (id, packed, _) in ks.respond(&qs) {
         let parts: Vec<HashPart> = packed.iter_decoded().map(Result::unwrap).collect();
         qs_done.incorporate_response(id, &parts).unwrap();
     }

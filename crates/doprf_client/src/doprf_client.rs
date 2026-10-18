@@ -68,6 +68,42 @@ impl<'a, S> DoprfConfig<'a, S> {
 }
 
 #[derive(Debug)]
+/// A screening proof waiting for the HDB's attestation.
+struct PendingReceipt {
+    statement: zk_types::ScreeningStatement,
+    proof: Vec<u8>,
+    salt: zk_types::Digest32,
+    windows: Vec<Vec<u8>>,
+}
+
+impl PendingReceipt {
+    /// Checks the HDB attested to exactly this statement, with a valid signature.
+    fn into_receipt(
+        self,
+        signed: zk_types::SignedHdbAttestation,
+    ) -> Result<zk_types::ZkReceipt, DoprfError> {
+        let bad = |why: &str| DoprfError::ZkError(format!("invalid HDB attestation: {why}"));
+        let att = &signed.attestation;
+        if att.statement_digest != zk_types::statement_digest(&self.statement) {
+            return Err(bad("statement mismatch"));
+        }
+        if att.hdb_hashes_digest != self.statement.hdb_hashes_digest {
+            return Err(bad("hashes mismatch"));
+        }
+        let signature: [u8; 64] = signed.signature.as_slice().try_into().map_err(|_| bad("signature length"))?;
+        certificates::PublicKey::from_bytes(att.hdb_public_key)
+            .verify(&att.message(), &certificates::Signature::from_bytes(signature))
+            .map_err(|_| bad("signature"))?;
+        Ok(zk_types::ZkReceipt {
+            statement: self.statement,
+            proof: self.proof,
+            salt: self.salt,
+            attestation: signed,
+            windows: self.windows,
+        })
+    }
+}
+
 pub struct DoprfOutput {
     /// The number of hashes sent to the HDB
     pub n_hashes: u64,
@@ -75,6 +111,8 @@ pub struct DoprfOutput {
     pub too_short: bool,
     /// The consolidation returned from the HDB
     pub response: HdbScreeningResult,
+    /// zkSecureDNA receipt, when screening ran with `ZK_PROOF_MODE=prove`.
+    pub zk_receipt: Option<zk_types::ZkReceipt>,
 }
 
 impl DoprfOutput {
@@ -83,6 +121,7 @@ impl DoprfOutput {
             n_hashes: 0,
             too_short: true,
             response: HdbScreeningResult::default(),
+            zk_receipt: None,
         }
     }
 }
@@ -317,7 +356,7 @@ impl<'a, S> DoprfClient<'a, S> {
     async fn hash_with_proof(
         &self,
         windows: &DoprfWindows,
-    ) -> Result<(PackedRistrettos<TaggedHash>, Option<Vec<u8>>), DoprfError> {
+    ) -> Result<(PackedRistrettos<TaggedHash>, Option<PendingReceipt>), DoprfError> {
         use crate::operations::make_keyserver_querysets_with_witness;
         use zk_prover::{ClientProver, ProofMode};
 
@@ -346,12 +385,11 @@ impl<'a, S> DoprfClient<'a, S> {
         // Prove the queries were built correctly while the keyservers work.
         let now = get_now();
         let querystate_ristrettos = PackedRistrettos::<Query>::from(&querystate);
-        let (query_proofs, keyserver_responses) = futures::join!(
+        let (query_proofs, proved_responses) = futures::join!(
             prover.prove_queries(mode, &witness, &self.active_security_key),
-            ks.query(hash_total_count, &querystate_ristrettos),
+            ks.query_proved(hash_total_count, &querystate_ristrettos),
         );
-        let (query_proofs, keyserver_responses) =
-            (query_proofs.map_err(zk_err)?, keyserver_responses?);
+        let (query_proofs, proved_responses) = (query_proofs.map_err(zk_err)?, proved_responses?);
         debug!("Query proofs and keyservers done. Took: {:.2?}", now.elapsed());
 
         let screening = prover
@@ -359,10 +397,14 @@ impl<'a, S> DoprfClient<'a, S> {
                 mode,
                 query_proofs,
                 &querystate.to_serializable_set(),
-                &keyserver_responses,
+                &proved_responses,
             )
             .await
             .map_err(zk_err)?;
+        let keyserver_responses = proved_responses
+            .into_iter()
+            .map(|(id, parts, _)| (id, parts))
+            .collect();
 
         let hashes: PackedRistrettos<TaggedHash> =
             incorporate_responses_and_hash(self.config.request_ctx, querystate, keyserver_responses)
@@ -381,7 +423,13 @@ impl<'a, S> DoprfClient<'a, S> {
             screening.statement,
             screening.timings
         );
-        Ok((hashes, screening.proof))
+        let pending = screening.proof.map(|proof| PendingReceipt {
+            statement: screening.statement,
+            proof,
+            salt: screening.salt,
+            windows: witness.windows,
+        });
+        Ok((hashes, pending))
     }
 }
 
@@ -415,35 +463,43 @@ where
             n_hashes: 0,
             too_short: false,
             response: HdbScreeningResult::default(),
+            zk_receipt: None,
         });
     }
 
     info!("{}: generated {} windows", client.id(), windows.count);
     #[cfg(feature = "zk")]
-    let (hashes, zk_proof) = client.hash_with_proof(&windows).await?;
+    let (hashes, pending) = client.hash_with_proof(&windows).await?;
     #[cfg(not(feature = "zk"))]
-    let (hashes, zk_proof): (PackedRistrettos<TaggedHash>, Option<Vec<u8>>) =
+    let (hashes, pending): (PackedRistrettos<TaggedHash>, Option<PendingReceipt>) =
         (client.hash(&windows).await?, None);
+    let mut zk_receipt = None;
 
     let mut response = match &client.config.ets {
         ets if !ets.is_empty() => {
             let et_windows = client.window(ets.iter().flat_map(|w| w.et.token.dna_sequences()))?;
             let et_hashes = client.hash(&et_windows).await?;
             let now = get_now();
-            let response = client
+            let (response, attestation) = client
                 .hdb_client
-                .query_with_ets(&hashes, ets, et_hashes)
+                .query_with_ets(&hashes, ets, et_hashes, pending.as_ref().map(|p| p.proof.as_slice()))
                 .await?;
+            if let (Some(pending), Some(attestation)) = (pending, attestation) {
+                zk_receipt = Some(pending.into_receipt(attestation)?);
+            }
             let hdb_duration = now.elapsed();
             debug!("Querying HDB done. Took: {:.2?}", hdb_duration);
             response
         }
         _ => {
             let now = get_now();
-            let response = client
+            let (response, attestation) = client
                 .hdb_client
-                .query(&hashes, zk_proof.as_deref())
+                .query(&hashes, pending.as_ref().map(|p| p.proof.as_slice()))
                 .await?;
+            if let (Some(pending), Some(attestation)) = (pending, attestation) {
+                zk_receipt = Some(pending.into_receipt(attestation)?);
+            }
             let hdb_duration = now.elapsed();
             debug!("Querying HDB done. Took: {:.2?}", hdb_duration);
             response
@@ -464,6 +520,7 @@ where
         n_hashes: windows.count,
         too_short: false,
         response,
+        zk_receipt,
     })
 }
 

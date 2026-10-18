@@ -195,6 +195,39 @@ impl ScepClient<KeyserverTokenGroup> {
             )
             .await
     }
+
+    /// zkSecureDNA: like [`Self::keyserve`], but also returns the keyserver's
+    /// DLEQ proof that every hash part used its keyshare.
+    pub async fn keyserve_proved(
+        &self,
+        queries: &PackedRistrettos<Query>,
+    ) -> Result<(PackedRistrettos<HashPart>, doprf::dleq::DleqProof), HttpError> {
+        let body: Vec<u8> = queries.iter_encoded().flatten().copied().collect();
+        let url = format!("{}{}", self.domain, scep::KEYSERVE_PROVED_ENDPOINT);
+        let response = self
+            .api_client
+            .bytes_bytes_post(
+                &url,
+                body.into(),
+                Query::CONTENT_TYPE,
+                scep::KEYSERVE_PROVED_CONTENT_TYPE,
+            )
+            .await?;
+        let proof_start = response
+            .len()
+            .checked_sub(doprf::dleq::DleqProof::SIZE)
+            .filter(|n| n % 32 == 0 && n / 32 == queries.len())
+            .ok_or_else(|| HttpError::DecodeError {
+                decoding: format!("proved keyserve response from {url}"),
+                source: "unexpected length".into(),
+            })?;
+        let parts: PackedRistrettos<HashPart> = response[..proof_start]
+            .chunks_exact(32)
+            .map(|c| <[u8; 32]>::try_from(c).unwrap())
+            .collect();
+        let proof = doprf::dleq::DleqProof::from_bytes(response[proof_start..].try_into().unwrap());
+        Ok((parts, proof))
+    }
 }
 
 impl ScepClient<DatabaseTokenGroup> {
@@ -242,7 +275,7 @@ impl ScepClient<DatabaseTokenGroup> {
         &self,
         hashes: &PackedRistrettos<TaggedHash>,
         proof: &[u8],
-    ) -> Result<HdbScreeningResult, HttpError> {
+    ) -> Result<zk_types::ScreenAndVerifyResponse<HdbScreeningResult>, HttpError> {
         let hash_bytes: Vec<u8> = hashes.iter_encoded().flatten().copied().collect();
         let body = zk_types::encode_screen_and_verify(&hash_bytes, proof);
         self.api_client
@@ -260,6 +293,33 @@ impl ScepClient<DatabaseTokenGroup> {
         ets: &[WithOtps<TokenBundle<ExemptionTokenGroup>>],
         et_hashes: &PackedRistrettos<CompletedHashValue>,
     ) -> Result<HdbScreeningResult, HttpError> {
+        self.submit_exemptions(ets, et_hashes).await?;
+        self.api_client
+            .ristretto_json_post(
+                &format!("{}{}", self.domain, scep::EXEMPTION_SCREEN_HASHES_ENDPOINT),
+                hashes,
+            )
+            .await
+    }
+
+    /// zkSecureDNA: exemption screening whose final step carries a proof.
+    pub async fn screen_with_ets_and_verify(
+        &self,
+        hashes: &PackedRistrettos<TaggedHash>,
+        ets: &[WithOtps<TokenBundle<ExemptionTokenGroup>>],
+        et_hashes: &PackedRistrettos<CompletedHashValue>,
+        proof: &[u8],
+    ) -> Result<zk_types::ScreenAndVerifyResponse<HdbScreeningResult>, HttpError> {
+        self.submit_exemptions(ets, et_hashes).await?;
+        self.screen_and_verify(hashes, proof).await
+    }
+
+    /// Exemption steps that precede the final screening request.
+    async fn submit_exemptions(
+        &self,
+        ets: &[WithOtps<TokenBundle<ExemptionTokenGroup>>],
+        et_hashes: &PackedRistrettos<CompletedHashValue>,
+    ) -> Result<(), HttpError> {
         let et_pems: Result<Vec<_>, _> = ets
             .iter()
             .map(|w| w.as_ref().try_map(|e| e.to_file_contents()))
@@ -314,12 +374,7 @@ impl ScepClient<DatabaseTokenGroup> {
                 )
                 .await?;
         }
-        self.api_client
-            .ristretto_json_post(
-                &format!("{}{}", self.domain, scep::EXEMPTION_SCREEN_HASHES_ENDPOINT),
-                hashes,
-            )
-            .await
+        Ok(())
     }
 }
 

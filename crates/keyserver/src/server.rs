@@ -225,6 +225,18 @@ async fn respond(
             )
             .await
         }
+        scep::KEYSERVE_PROVED_ENDPOINT => {
+            handle_post(
+                &method,
+                handle_scep_err(
+                    &ks_state.metrics,
+                    request_id,
+                    peer,
+                    crate::keyserve::scep_endpoint_keyserve_proved(request_id, &ks_state, request),
+                ),
+            )
+            .await
+        }
         _ => response::not_found(),
     };
     add_cors_headers(&headers, response.headers_mut());

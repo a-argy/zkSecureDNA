@@ -57,6 +57,18 @@ impl KeyShare {
         HashPart::from_rp(c * self.0 * q.to_rp())
     }
 
+    /// zkSecureDNA: proves `parts[j] = c * keyshare * queries[j]` for all `j`
+    /// (see [`crate::dleq`]). `c` is this keyserver's Lagrange coefficient.
+    pub fn prove_responses(
+        &self,
+        c: &Scalar,
+        domain: &[u8],
+        queries: &[[u8; 32]],
+        parts: &[[u8; 32]],
+    ) -> Result<crate::dleq::DleqProof, crate::dleq::DleqError> {
+        crate::dleq::prove(domain, &(c * self.0), queries, parts)
+    }
+
     pub fn multiply_by_rp(&self, point: RistrettoPoint) -> RistrettoPoint {
         self.0 * point
     }

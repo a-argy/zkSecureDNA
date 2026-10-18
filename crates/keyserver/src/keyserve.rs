@@ -202,3 +202,118 @@ pub async fn scep_endpoint_keyserve(
     let response = response.map(|body| BodyExt::map_err(body, anyhow::Error::from).boxed());
     Ok(response)
 }
+
+/// zkSecureDNA: like [`scep_endpoint_keyserve`], but buffers the whole batch
+/// and appends a batched DLEQ proof (see `doprf::dleq`) that every hash part
+/// was computed with this keyserver's keyshare. Response body:
+/// `hash parts ‖ 64-byte proof`.
+pub async fn scep_endpoint_keyserve_proved(
+    request_id: &RequestId,
+    server_state: &Arc<KeyserverState>,
+    request: Request<Incoming>,
+) -> Result<GenericResponse, scep::error::ScepError<scep::error::Keyserve>> {
+    check_content_type(request.headers(), Query::CONTENT_TYPE)
+        .context("in keyserve-proved")
+        .map_err(scep::error::ScepError::InvalidMessage)?;
+
+    let cookie = scep_server_helpers::request::get_session_cookie(request.headers())?;
+
+    let _permit = match server_state.throttle_heavy_requests() {
+        Ok(permit) => permit,
+        Err(_) => return Err(scep::error::ScepError::Overloaded),
+    };
+
+    if let Some(metrics) = &server_state.metrics {
+        metrics.requests.inc();
+    }
+
+    let client_state = server_state
+        .scep
+        .clients
+        .write()
+        .await
+        .take_session(&cookie)
+        .ok_or_else(|| {
+            scep::error::ScepError::InvalidMessage(anyhow::anyhow!("unknown cookie {cookie}"))
+        })?;
+    let client_mid = client_state.client_mid();
+    let nucleotide_total_count = client_state.open_request().nucleotide_total_count;
+
+    let hash_count_from_content_len =
+        check_content_length(request.body().size_hint().exact(), HASH_SIZE)
+            .context("in keyserve-proved")
+            .map_err(scep::error::ScepError::InvalidMessage)?;
+
+    // Validates the requested count against what the session was opened for.
+    let keyserver_id_set =
+        scep::steps::server_keyserve_client(hash_count_from_content_len, client_state)?;
+
+    info!("{request_id}: Processing proved request of size {hash_count_from_content_len}");
+
+    if let Err(e) = event_store::insert_keyserve_event(
+        &server_state.persistence_connection,
+        client_mid,
+        nucleotide_total_count,
+    )
+    .await
+    {
+        error!("Failed to persist keyserve event for {client_mid}: {e}");
+    }
+
+    let body = request
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| scep::error::ScepError::InvalidMessage(e.into()))?
+        .to_bytes();
+    if body.len() != hash_count_from_content_len as usize * HASH_SIZE {
+        return Err(scep::error::ScepError::InvalidMessage(anyhow::anyhow!(
+            "body length does not match content-length"
+        )));
+    }
+
+    let keyshare = server_state.keyshare;
+    let keyserver_id = server_state.keyserver_id;
+    let metrics = server_state.metrics.clone();
+    let out = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+        let lagrange_coeff = keyserver_id_set.langrange_coefficient_for_id(&keyserver_id);
+        let mut queries = Vec::with_capacity(body.len() / HASH_SIZE);
+        let mut parts = Vec::with_capacity(body.len() / HASH_SIZE);
+        for chunk in body.chunks_exact(HASH_SIZE) {
+            let bytes: &[u8; HASH_SIZE] = chunk.try_into().unwrap();
+            let query: Query = bytes.try_into().context("invalid query point")?;
+            let part: [u8; HASH_SIZE] =
+                keyshare.apply_query_and_lagrange_coefficient(query, &lagrange_coeff).into();
+            if let Some(metrics) = &metrics {
+                metrics.hash_counter.inc();
+            }
+            queries.push(*bytes);
+            parts.push(part);
+        }
+        let ids: Vec<u32> = keyserver_id_set.iter().map(u32::from).collect();
+        let domain = doprf::dleq::keyserve_domain(u32::from(&keyserver_id), &ids);
+        let proof = keyshare
+            .prove_responses(&lagrange_coeff, &domain, &queries, &parts)
+            .context("proving responses")?;
+        let mut out = Vec::with_capacity(parts.len() * HASH_SIZE + doprf::dleq::DleqProof::SIZE);
+        for p in &parts {
+            out.extend_from_slice(p);
+        }
+        out.extend_from_slice(&proof.to_bytes());
+        Ok(out)
+    })
+    .await
+    .map_err(|e| scep::error::ScepError::InvalidMessage(e.into()))?
+    .map_err(scep::error::ScepError::InvalidMessage)?;
+
+    let mut response = Response::new(
+        http_body_util::Full::new(Bytes::from(out))
+            .map_err(|never| match never {})
+            .boxed(),
+    );
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(scep::KEYSERVE_PROVED_CONTENT_TYPE),
+    );
+    Ok(response)
+}

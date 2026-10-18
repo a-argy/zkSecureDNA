@@ -84,7 +84,7 @@ impl HdbClient {
         self,
         hashes: &PackedRistrettos<TaggedHash>,
         proof: Option<&[u8]>,
-    ) -> Result<HdbScreeningResult, DoprfError> {
+    ) -> Result<(HdbScreeningResult, Option<zk_types::SignedHdbAttestation>), DoprfError> {
         let hash_total_count = hashes
             .len()
             .try_into()
@@ -104,8 +104,11 @@ impl HdbClient {
         retry_with_timeout_and_mark_bad(
             || async {
                 Ok(match proof {
-                    Some(proof) => self.client.screen_and_verify(hashes, proof).await?,
-                    None => self.client.screen(hashes).await?,
+                    Some(proof) => {
+                        let r = self.client.screen_and_verify(hashes, proof).await?;
+                        (r.result, Some(r.attestation))
+                    }
+                    None => (self.client.screen(hashes).await?, None),
                 })
             },
             &self.server.bad_flag,
@@ -119,7 +122,8 @@ impl HdbClient {
         hashes: &PackedRistrettos<TaggedHash>,
         ets: &[WithOtps<TokenBundle<ExemptionTokenGroup>>],
         et_hashes: PackedRistrettos<CompletedHashValue>,
-    ) -> Result<HdbScreeningResult, DoprfError> {
+        proof: Option<&[u8]>,
+    ) -> Result<(HdbScreeningResult, Option<zk_types::SignedHdbAttestation>), DoprfError> {
         let hash_total_count = hashes
             .len()
             .try_into()
@@ -137,7 +141,18 @@ impl HdbClient {
         .await?;
 
         retry_with_timeout_and_mark_bad(
-            || async { Ok(self.client.screen_with_ets(hashes, ets, &et_hashes).await?) },
+            || async {
+                Ok(match proof {
+                    Some(proof) => {
+                        let r = self
+                            .client
+                            .screen_with_ets_and_verify(hashes, ets, &et_hashes, proof)
+                            .await?;
+                        (r.result, Some(r.attestation))
+                    }
+                    None => (self.client.screen_with_ets(hashes, ets, &et_hashes).await?, None),
+                })
+            },
             &self.server.bad_flag,
         )
         .await
@@ -220,6 +235,30 @@ impl KeyserverClient {
         .await
     }
 
+    /// zkSecureDNA: like [`Self::query`], using the proved keyserve endpoint.
+    pub async fn query_proved(
+        self,
+        hash_total_count: u64,
+        queries: &PackedRistrettos<Query>,
+    ) -> Result<(PackedRistrettos<HashPart>, doprf::dleq::DleqProof), DoprfError> {
+        retry_with_timeout_and_mark_bad(
+            || async {
+                Ok(self
+                    .client
+                    .authenticate(self.state.clone(), hash_total_count)
+                    .await?)
+            },
+            &self.server.bad_flag,
+        )
+        .await?;
+
+        retry_with_timeout_and_mark_bad(
+            || async { Ok(self.client.keyserve_proved(queries).await?) },
+            &self.server.bad_flag,
+        )
+        .await
+    }
+
     pub fn domain(&self) -> &str {
         &self.server.domain
     }
@@ -232,6 +271,9 @@ impl KeyserverClient {
 pub struct KeyserverSetClient {
     clients: Vec<KeyserverClient>,
 }
+
+/// A keyserver's hash parts and its DLEQ proof over them.
+pub type KeyserverResponseWithProof = (KeyserverId, PackedRistrettos<HashPart>, doprf::dleq::DleqProof);
 
 impl KeyserverSetClient {
     /// Open an SCEP session with all keyservers in parallel
@@ -273,6 +315,28 @@ impl KeyserverSetClient {
                         .query(hash_total_count, queries)
                         .await
                         .map(|hash_parts| (client_id, hash_parts))
+                }
+            })
+            .collect::<FuturesUnordered<_>>()
+            .try_collect()
+            .await
+    }
+
+    /// zkSecureDNA: like [`Self::query`], with each keyserver's DLEQ proof.
+    pub async fn query_proved(
+        self,
+        hash_total_count: u64,
+        queries: &PackedRistrettos<Query>,
+    ) -> Result<Vec<KeyserverResponseWithProof>, DoprfError> {
+        self.clients
+            .into_iter()
+            .map(|client| {
+                let client_id = client.server.id;
+                async move {
+                    client
+                        .query_proved(hash_total_count, queries)
+                        .await
+                        .map(|(parts, proof)| (client_id, parts, proof))
                 }
             })
             .collect::<FuturesUnordered<_>>()

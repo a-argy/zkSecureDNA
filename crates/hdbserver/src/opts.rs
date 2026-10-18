@@ -164,7 +164,7 @@ pub struct Config {
 
     #[clap(
         long,
-        help = "Hex digest (zk_types::active_security_key_digest) of the trusted active-security key. If set, zk proofs made with any other key are rejected.",
+        help = "Hex digest (zk_types::active_security_key_digest) of the trusted active-security key; required with --zk-verify. Proofs made with any other key are rejected.",
         env = "SECUREDNA_HDBSERVER_ZK_ACTIVE_SECURITY_KEY_DIGEST"
     )]
     #[serde(default)]

@@ -152,16 +152,14 @@ async fn reconfigure(
         // Verifier setup derives verifying keys from the circuits; reuse on reload.
         Some(zk)
     } else {
-        let trusted_active_security_key = app_cfg
-            .zk_active_security_key_digest
-            .as_deref()
-            .map(|h| -> anyhow::Result<_> {
-                let bytes = hex::decode(h).context("zk active security key digest is not hex")?;
-                bytes
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("zk active security key digest must be 32 bytes"))
-            })
-            .transpose()?;
+        // Without a pinned key, a lab could run its own keyservers.
+        let digest = app_cfg.zk_active_security_key_digest.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--zk-verify requires --zk-active-security-key-digest")
+        })?;
+        let bytes = hex::decode(digest).context("zk active security key digest is not hex")?;
+        let trusted_active_security_key: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("zk active security key digest must be 32 bytes"))?;
         let verifier = zk_prover::ScreeningVerifier::new()
             .await
             .context("setting up zk verifier")?;

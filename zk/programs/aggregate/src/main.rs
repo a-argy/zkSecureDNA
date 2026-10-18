@@ -6,7 +6,8 @@
 #![no_main]
 sp1_zkvm::entrypoint!(main);
 
-use doprf::party::KeyserverId;
+use doprf::dleq::{self, DleqProof};
+use doprf::party::{KeyserverId, KeyserverIdSet};
 use doprf::prf::{HashPart, SerializableQueryStateSet};
 use doprf::tagged::TaggedHash;
 use packed_ristretto::PackedRistrettos;
@@ -36,7 +37,8 @@ pub fn main() {
     let mut querystate = sp1_zkvm::io::read::<SerializableQueryStateSet>()
         .to_query_state_set()
         .expect("malformed query state");
-    let keyserver_responses = sp1_zkvm::io::read::<Vec<(KeyserverId, PackedRistrettos<HashPart>)>>();
+    let keyserver_responses =
+        sp1_zkvm::io::read::<Vec<(KeyserverId, PackedRistrettos<HashPart>, DleqProof)>>();
 
     // Bind the query state to the sub-proofs.
     let queries: Vec<[u8; 32]> = querystate.queries().map(|q| *q.as_bytes()).collect();
@@ -59,18 +61,37 @@ pub fn main() {
     let ask_digest = active_security_key_digest(&target.commitment_bytes());
     assert_eq!(ask_digest, checksum_out.active_security_key_digest, "active security key does not match checksum proof");
 
+    // Exactly a quorum of distinct keyservers must have answered.
+    let keyserver_ids: KeyserverIdSet = keyserver_responses.iter().map(|(id, _, _)| *id).collect();
+    let id_list: Vec<u32> = keyserver_ids.iter().map(u32::from).collect();
+    assert!(id_list.windows(2).all(|w| w[0] < w[1]), "duplicate keyserver");
+    assert_eq!(id_list.len(), target.commitment_bytes().len(), "wrong number of keyservers");
+
     // Complete the DOPRF, mirroring incorporate_responses_and_hash in
-    // crates/doprf_client/src/operations.rs (without thread spawning).
+    // crates/doprf_client/src/operations.rs (without thread spawning), and
+    // check each keyserver's DLEQ proof against its public key, interpolated
+    // from the active-security commitments.
     let mut decoded_responses = Vec::with_capacity(keyserver_responses.len());
-    for (id, packed) in &keyserver_responses {
+    for (id, packed, proof) in &keyserver_responses {
         let parts = packed
             .iter_decoded()
             .collect::<Result<Vec<HashPart>, _>>()
             .expect("malformed keyserver response");
+        let part_bytes: Vec<[u8; 32]> = parts.iter().map(|p| *p.as_bytes()).collect();
+        let public_key =
+            keyserver_ids.langrange_coefficient_for_id(id) * querystate.randomized_target.keyserver_public_key(id);
+        dleq::verify(
+            &dleq::keyserve_domain(u32::from(id), &id_list),
+            &public_key,
+            &queries,
+            &part_bytes,
+            proof,
+        )
+        .expect("keyserver DLEQ proof does not verify");
         querystate
             .incorporate_response(*id, &parts)
             .expect("keyserver response has wrong size");
-        decoded_responses.push((id.as_u32(), parts.iter().map(|p| *p.as_bytes()).collect::<Vec<_>>()));
+        decoded_responses.push((id.as_u32(), part_bytes));
     }
 
     // Also runs the active-security validation; fails if any keyserver cheated.

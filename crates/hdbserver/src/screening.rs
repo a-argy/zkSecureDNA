@@ -88,7 +88,7 @@ pub async fn scep_endpoint_screen_and_verify(
         return Err(invalid(anyhow::anyhow!("this server does not accept zk proofs")));
     };
     check_content_type(request.headers(), zk_prover::zk_types::SCREEN_AND_VERIFY_CONTENT_TYPE)
-        .map_err(invalid)?;
+        .map_err(|e| invalid(e.into()))?;
 
     let (mut parts, body) = request.into_parts();
     let body = http_body_util::Limited::new(body, MAX_SCREEN_AND_VERIFY_BODY)

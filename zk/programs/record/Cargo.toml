@@ -1,0 +1,15 @@
+[package]
+name = "zksecuredna-record"
+version = "0.2.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sp1-zkvm = { workspace = true, features = ["verify"] }
+curve25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+alloy-sol-types = { workspace = true }
+zk_types = { workspace = true }
+zk_escrow = { workspace = true }
+bincode = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "zk_escrow"
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+edition = "2021"
+
+# Field encryption to a threshold-shared authority key, and threshold
+# decryption. Compiled for the zkVM (record circuit) and the host.
+[dependencies]
+curve25519-dalek = { workspace = true, features = ["digest", "rand_core"] }
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10.9"
+rand = "0.8.5"
+doprf = { path = "../doprf", default-features = false }

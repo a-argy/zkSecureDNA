@@ -220,3 +220,14 @@ pub struct ZkReceipt {
     /// The screened windows, in order (opens the order commitment).
     pub windows: Vec<Vec<u8>>,
 }
+
+/// `SHA-256` over the three circuit verifying keys a record depends on; the
+/// registry pins this per screening protocol.
+pub fn circuits_digest(aggregate: &[u32; 8], hash: &[u32; 8], checksum: &[u32; 8]) -> Digest32 {
+    let mut h = Sha256::new();
+    h.update(b"zksecuredna/circuits/v1");
+    for w in aggregate.iter().chain(hash).chain(checksum) {
+        h.update(w.to_le_bytes());
+    }
+    h.finalize().into()
+}

@@ -40,3 +40,4 @@ out/
 
 # docker output
 client_output
+zk/target/

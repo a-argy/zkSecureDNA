@@ -72,6 +72,11 @@ Tests:
 - `crates/zk_prover/examples/record_fixture.rs`: end to end from screening to
   record, including a 2-of-3 field opening.
 
+Upstream unit tests for every modified crate pass. The exception is
+`certificates/tests/check_test_certs.rs`: its 8 failures also occur on
+unmodified upstream, because the bundled test certificates no longer
+validate as of October 2026.
+
 ## Running
 
 Prerequisites: Rust (see `rust-toolchain.toml`), [SP1](https://docs.succinct.xyz)

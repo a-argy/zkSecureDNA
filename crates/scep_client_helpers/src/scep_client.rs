@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use streamed_ristretto::HasContentType;
+
 use crate::ClientCerts;
 use certificates::key_traits::CanLoadKey;
 use certificates::{

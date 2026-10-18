@@ -246,6 +246,47 @@ pub fn combine_shares(
         .sum())
 }
 
+impl DecryptionShare {
+    pub const SIZE: usize = 4 + 32 + DleqProof::SIZE;
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        out[..4].copy_from_slice(&self.index.to_le_bytes());
+        out[4..36].copy_from_slice(&self.share);
+        out[36..].copy_from_slice(&self.proof.to_bytes());
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::SIZE {
+            return None;
+        }
+        Some(Self {
+            index: u32::from_le_bytes(bytes[..4].try_into().ok()?),
+            share: bytes[4..36].try_into().ok()?,
+            proof: DleqProof::from_bytes(bytes[36..].try_into().ok()?),
+        })
+    }
+}
+
+/// Field index used when sealing decryption shares to a case recipient, so
+/// share ciphertexts can never be confused with record fields.
+const SHARE_SEAL_FIELD: u32 = u32::MAX;
+
+/// Seals a decryption share to the case recipient's key (what an authority
+/// posts on chain with `submitDecryptionShare`).
+pub fn seal_share(recipient: &RistrettoPoint, share: &DecryptionShare) -> Vec<u8> {
+    use rand::rngs::OsRng;
+    encrypt_field(recipient, SHARE_SEAL_FIELD, &Scalar::random(&mut OsRng), &share.to_bytes()).to_bytes()
+}
+
+/// Opens a sealed share with the recipient's secret key.
+pub fn unseal_share(recipient_secret: &Scalar, sealed: &[u8]) -> Option<DecryptionShare> {
+    let field = EncryptedField::from_bytes(sealed)?;
+    let shared = decompress(&field.ephemeral)? * recipient_secret;
+    DecryptionShare::from_bytes(&decrypt_field(&shared, SHARE_SEAL_FIELD, &field))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +327,19 @@ mod tests {
         let mut three: Vec<_> = shares[..3].iter().map(|a| decryption_share(a, &record_id, 0, &enc).unwrap()).collect();
         three[2].share = RistrettoPoint::random(&mut OsRng).compress().to_bytes();
         assert_eq!(combine_shares(&keys, 3, &record_id, 0, &enc, &three), Err(OpenError::BadShareProof(3)));
+    }
+
+    #[test]
+    fn sealed_shares_open_only_for_the_recipient() {
+        let (pk, shares) = deal_committee(2, 3);
+        let enc = encrypt_field(&pk, 1, &Scalar::random(&mut OsRng), b"purpose");
+        let share = decryption_share(&shares[0], &[9u8; 32], 1, &enc).unwrap();
+        let recipient = Scalar::random(&mut OsRng);
+        let sealed = seal_share(&(RISTRETTO_BASEPOINT_POINT * recipient), &share);
+        let opened = unseal_share(&recipient, &sealed).unwrap();
+        assert_eq!(opened.to_bytes(), share.to_bytes());
+        let other = Scalar::random(&mut OsRng);
+        assert!(unseal_share(&other, &sealed).map(|s| s.to_bytes() != share.to_bytes()).unwrap_or(true));
     }
 
     #[test]

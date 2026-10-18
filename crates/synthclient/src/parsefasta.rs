@@ -323,6 +323,18 @@ pub async fn check_parsed_fasta<T: NucleotideLike>(
         e
     })?;
 
+    // zkSecureDNA: keep the receipt (proof, HDB attestation, commitment
+    // opening) for building an on-chain record. It contains the screened
+    // windows, so it is written only to a directory the operator chooses.
+    if let (Some(receipt), Ok(dir)) = (&output.zk_receipt, std::env::var("ZK_RECEIPT_DIR")) {
+        let path = std::path::Path::new(&dir).join(format!("{}.json", request_ctx.id));
+        match serde_json::to_vec(receipt).map(|json| std::fs::write(&path, json)) {
+            Ok(Ok(())) => info!("{request_ctx}: wrote zk receipt to {}", path.display()),
+            Ok(Err(e)) => info!("{request_ctx}: could not write zk receipt: {e}"),
+            Err(e) => info!("{request_ctx}: could not encode zk receipt: {e}"),
+        }
+    }
+
     let synthesis_permission = synthesis_permission::SynthesisPermission::merge(
         output
             .response

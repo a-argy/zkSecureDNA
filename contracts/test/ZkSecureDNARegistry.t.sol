@@ -191,7 +191,7 @@ contract ZkSecureDNARegistryTest is Test {
     function test_case_needs_threshold_before_shares() public {
         uint256 rid = _record();
         vm.prank(a1);
-        uint256 cid = registry.openCase(rid, 0b001, bytes32("recipient"), "ipfs://warrant");
+        uint256 cid = registry.openCase(rid, 1, bytes32("recipient"), "ipfs://warrant");
         assertFalse(registry.getCase(cid).authorized);
 
         vm.prank(a1);
@@ -199,7 +199,7 @@ contract ZkSecureDNARegistryTest is Test {
         registry.submitDecryptionShare(cid, 0, hex"aa");
 
         vm.expectEmit(true, true, true, true);
-        emit ZkSecureDNARegistry.CaseAuthorized(cid, rid, lab, 0b001);
+        emit ZkSecureDNARegistry.CaseAuthorized(cid, rid, lab, 1);
         vm.prank(a2);
         registry.approveCase(cid);
         assertTrue(registry.getCase(cid).authorized);
@@ -213,7 +213,7 @@ contract ZkSecureDNARegistryTest is Test {
     function test_case_only_reveals_masked_fields_once_per_authority() public {
         uint256 rid = _record();
         vm.prank(a1);
-        uint256 cid = registry.openCase(rid, 0b100, bytes32("recipient"), "case-7");
+        uint256 cid = registry.openCase(rid, 4, bytes32("recipient"), "case-7");
         vm.prank(a3);
         registry.approveCase(cid);
 

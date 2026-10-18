@@ -5782,6 +5782,7 @@ dependencies = [
  "scep",
  "serde_json",
  "shared_types",
+ "streamed_ristretto",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

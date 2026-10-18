@@ -9158,6 +9158,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zk_escrow"
+version = "1.0.8"
+dependencies = [
+ "curve25519-dalek",
+ "doprf",
+ "rand",
+ "serde",
+ "sha2",
+]
+
+[[package]]
 name = "zk_prover"
 version = "1.0.8"
 dependencies = [
@@ -9174,6 +9185,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "zk_escrow",
  "zk_types",
 ]
 

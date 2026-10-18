@@ -31,5 +31,8 @@ curve25519-dalek = { workspace = true }
 sp1-build = "6.9.0"
 
 [dev-dependencies]
+alloy-sol-types = "1.0"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+hex = "0.4"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

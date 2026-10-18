@@ -231,6 +231,10 @@ async fn test_hdb() {
         keypair_passphrase_file: format!("{certs_dir}/database-token.passphrase").into(),
         allow_insecure_cookie: true,
         event_store_path: ":memory:".into(),
+        // With ZK_PROOF_MODE=prove (and the `zk` feature), screening goes
+        // through /scep/screen-and-verify, so the HDB must verify.
+        zk_verify: std::env::var("ZK_PROOF_MODE").as_deref() == Ok("prove"),
+        zk_active_security_key_digest: None,
     };
     let server_config = Arc::new(ServerConfig {
         main: PlaneConfig {

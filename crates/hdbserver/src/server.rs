@@ -537,6 +537,8 @@ mod test {
             keypair_passphrase_file: "test/certs/database-token.passphrase".into(),
             allow_insecure_cookie: true,
             event_store_path: Config::default_event_store_path(),
+            zk_verify: false,
+            zk_active_security_key_digest: None,
         };
         let server_config = ServerConfig {
             main: PlaneConfig {

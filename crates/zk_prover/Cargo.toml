@@ -23,3 +23,7 @@ zk_types = { path = "../zk_types" }
 
 [build-dependencies]
 sp1-build = "6.9.0"
+
+[dev-dependencies]
+curve25519-dalek = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

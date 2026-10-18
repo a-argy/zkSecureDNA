@@ -2,22 +2,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::sync::Arc;
-use tracing::debug;
+
 use anyhow::Context;
-use doprf::prf::{CompletedHashValue, VerificationInput};
+use doprf::prf::CompletedHashValue;
 use futures::{StreamExt, TryStreamExt};
-use http_body_util::{BodyExt, Full};
-use bytes::Bytes;
+use http_body_util::BodyExt;
 use hyper::body::{Body, Incoming};
 use hyper::{Request, StatusCode};
 use scep::states::{EtState, ServerStateForClient};
 use scep::steps::{server_et_client, server_et_seq_hashes_client};
 use tracing::{error, info, warn};
-use packed_ristretto::PackedRistrettos;
-use sp1_sdk::{
-    include_elf, HashableKey, ProverClient, SP1Proof, SP1ProofWithPublicValues, SP1Stdin,
-    SP1VerifyingKey,
-};
 
 use certificates::Issued;
 use doprf::tagged::{HashTag, TaggedHash};
@@ -31,7 +25,7 @@ use shared_types::hdb::HdbScreeningResult;
 use shared_types::requests::RequestId;
 use shared_types::synthesis_permission::SynthesisPermission;
 use streamed_ristretto::hyper::{check_content_length, from_request};
-use streamed_ristretto::stream::{check_content_type, ShortErrorMsg, StreamableRistretto, decode, encode};
+use streamed_ristretto::stream::{check_content_type, ShortErrorMsg, StreamableRistretto};
 use streamed_ristretto::HasContentType;
 
 use crate::event_store;
@@ -78,257 +72,74 @@ impl StreamableRistretto for UnparsedTaggedHash {
     }
 }
 
+/// Largest accepted `/scep/screen-and-verify` body (hashes plus proof).
+const MAX_SCREEN_AND_VERIFY_BODY: usize = 256 * 1024 * 1024;
+
+/// zkSecureDNA: verify a screening proof, then screen exactly the hashes it
+/// is about via the normal screening path. See docs/ZK-DESIGN.md.
 pub async fn scep_endpoint_screen_and_verify(
     request_id: &RequestId,
     hdbs_state: Arc<HdbServerState>,
     request: Request<Incoming>,
 ) -> Result<GenericResponse, scep::error::ScepError<scep::error::Screen>> {
-    #[derive(serde::Deserialize)]
-    struct RequestWithVerification {
-        ristretto_data: Vec<u8>,
-        verification: VerificationInput,
-    }
+    let invalid = |e: anyhow::Error| ScepError::InvalidMessage(e.context("in screen-and-verify"));
 
-    // Check content type for JSON
-    check_content_type(request.headers(), "application/json")
-        .context("in screen_and_verify")
-        .map_err(scep::error::ScepError::InvalidMessage)?;
+    let Some(zk) = hdbs_state.zk.clone() else {
+        return Err(invalid(anyhow::anyhow!("this server does not accept zk proofs")));
+    };
+    check_content_type(request.headers(), zk_prover::zk_types::SCREEN_AND_VERIFY_CONTENT_TYPE)
+        .map_err(invalid)?;
 
-    // Get session cookie
-    let cookie = scep_server_helpers::request::get_session_cookie(request.headers())?;
-
-    let client_state = hdbs_state
-        .scep
-        .clients
-        .write()
-        .await
-        .take_session(&cookie)
-        .ok_or_else(|| {
-            scep::error::ScepError::InvalidMessage(anyhow::anyhow!("unknown cookie {cookie}"))
-        })?;
-    let client_mid = client_state.open_request().client_mid();
-    let debug_info = client_state.open_request().debug_info;
-
-    // Consume body and deserialize
-    let bytes = request
-        .into_body()
+    let (mut parts, body) = request.into_parts();
+    let body = http_body_util::Limited::new(body, MAX_SCREEN_AND_VERIFY_BODY)
         .collect()
         .await
-        .map_err(|e| scep::error::ScepError::InvalidMessage(e.into()))?
+        .map_err(|e| invalid(anyhow::anyhow!("reading body: {e}")))?
         .to_bytes();
+    let (hashes, proof) = zk_prover::zk_types::decode_screen_and_verify(&body)
+        .ok_or_else(|| invalid(anyhow::anyhow!("malformed body")))?;
+    let hashes = body.slice_ref(hashes);
+    let proof = body.slice_ref(proof);
 
-    // Deserialize into our struct
-    let request_data: RequestWithVerification = serde_json::from_slice(&bytes)
-        .map_err(|e| scep::error::ScepError::InvalidMessage(e.into()))?;
-
-    // Verify the proof
-    let client = ProverClient::new();
-    let VerificationInput { proof, vk } = request_data.verification;
-    client.verify(&proof, &vk).expect("verification failed");
-    println!("HDB verification successful");
-
-    // Build a fake request to mimic the form expected in scep_endpoint_screen, data is moved
-    let fake_request = Request::builder()
-    .header("Content-Type", TaggedHash::CONTENT_TYPE)
-    .body(Full::new(Bytes::from(request_data.ristretto_data)))
-    .expect("failed to build fake request");
-
-    let hash_count_from_content_len =
-        check_content_length(fake_request.body().size_hint().exact(), TaggedHash::SIZE)
-            .context("in screen")
-            .map_err(scep::error::ScepError::InvalidMessage)?;
-
-    let (params, client_state) =
-        scep::steps::server_screen_client(hash_count_from_content_len, client_state)?;
-
-    let ScreenCommon {
-        region,
-        provider_reference,
-    } = params;
-
-    let permit = match hdbs_state.throttle_heavy_requests() {
-        Ok(permit) => permit,
-        Err(err_response) => return Ok(err_response),
-    };
-
-    let (ets, exemptions) = match client_state.et_state {
-        EtState::NoEt => (vec![], NO_EXEMPTIONS.clone()),
-        EtState::AwaitingEtSize | EtState::PromisedEt { .. } => {
-            return Err(scep::error::Screen::ScreenBeforeEt.into())
-        }
-        EtState::EtNeedsHashes { .. } => {
-            return Err(scep::error::Screen::ScreenBeforeEtHashes.into())
-        }
-        EtState::EtReady { ets, hashes } => {
-            let exemptions = exemptions_after_validation(
-                ets.clone(),
-                hashes.into_iter().collect(),
-                &hdbs_state.validator,
-                &hdbs_state.exemptions_roots,
-                &hdbs_state.scep.revocation_list,
-            )
-            .await
-            .map_err(|e| scep::error::Screen::EtValidation(e.to_string()))?;
-
-            (ets, Arc::new(exemptions))
-        }
-    };
-
-    if let Some(metrics) = &hdbs_state.metrics {
-        metrics.requests.inc();
-    }
-
-    let num_hashes = check_content_length(fake_request.body().size_hint().exact(), TaggedHash::SIZE)
-        .context("in screen")
-        .map_err(ScepError::InvalidMessage)?;
-    info!("{request_id}: Processing request of size {num_hashes}");
-
-    let queries = from_request(fake_request)
-        .context("in screen_and_verify")
-        .map_err(ScepError::InvalidMessage)?;
-
-    struct LogDone(RequestId);
-
-    impl Drop for LogDone {
-        fn drop(&mut self) {
-            info!("{}: Done.", self.0);
-        }
-    }
-
-    let logdone = LogDone(request_id.clone());
-
-    let screen_evt_id = match event_store::insert_screen_event(
-        &hdbs_state.persistence_connection,
-        client_mid,
-        client_state.open_request.nucleotide_total_count,
-        region,
-        &ets,
-    )
-    .await
-    {
-        Ok(id) => Some(id),
-        Err(e) => {
-            error!("Failed to persist screen event for {client_mid}: {e}");
-            None
-        }
-    };
-
-    let mut last_record = None;
-    let hdbs_state2 = hdbs_state.clone();
-    let exemptions2 = exemptions.clone();
-    let hdb_responses: Result<Vec<_>, anyhow::Error> = queries
-        .map(move |query| {
-            let _permit = &permit;
-            let _logdone = &logdone;
-
-            let hash_id_and_query = query.map(|query: UnparsedTaggedHash| {
-                let hash_id = HashId::new(query.hash_tag(), last_record);
-                last_record = Some(hash_id.record);
-                (hash_id, query)
-            });
-
-            let hdbs_state2 = hdbs_state2.clone();
-            let exemptions2 = exemptions2.clone();
-            async move {
-                let (hash_id, query) = hash_id_and_query?;
-
-                let permit = hdbs_state2
-                    .hdb_queries
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .unwrap();
-                // TODO: Maybe use a nursery to prevent orphans, so long as that's not too expensive?
-                let hdbs_state3 = hdbs_state2.clone();
-                let exemptions3 = exemptions2.clone();
-                let resp = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    let params = HdbParams {
-                        region,
-                        exemptions: &exemptions3,
-                    };
-                    let config = HdbConfig {
-                        database: &hdbs_state3.database,
-                        hlt: &hdbs_state3.hlt,
-                    };
-                    hdb::query_hdb(query.hash_bytes(), &params, &config)
-                })
-                .await
-                .unwrap()?;
-
-                // only incremented if there's no error
-                if let Some(metrics) = &hdbs_state2.metrics {
-                    metrics.hash_counter.inc();
-                }
-
-                Ok(resp.map(|r| (hash_id, r)))
-            }
-        })
-        .buffered(hdbs_state.parallelism_per_request)
-        .filter_map(|res| async { res.transpose() })
-        .try_collect()
-        .await;
-
-    let hdb_responses = match hdb_responses {
-        Ok(r) => r,
-        Err(err) => {
-            warn!("Error while processing HDB records: {err:?}");
-            if let Some(metrics) = &hdbs_state.metrics {
-                metrics.io_errors.inc();
-            }
-            return Ok(response::text(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error",
-            ));
-        }
-    };
-
-    let consolidation =
-        consolidate_windows(hdb_responses.into_iter(), &hdbs_state.hash_spec, debug_info)
-            .context("in screen consolidation")
-            .map_err(ScepError::InternalError)?;
-
-    let response: HdbScreeningResult = consolidation.to_hdb_screening_result(provider_reference);
-
-    let merged_permission =
-        SynthesisPermission::merge(response.results.iter().map(|r| r.synthesis_permission));
-    info!(
-        message = "screened",
-        %client_mid,
-        issued_to=client_state.open_request.cert_chain.token.issuer_description(),
-        screened_bp=client_state.open_request.nucleotide_total_count,
-        hash_count=hash_count_from_content_len,
-        %merged_permission,
-    );
-    if let Some(screen_evt_id) = screen_evt_id {
-        if let Err(e) = event_store::insert_screen_result(
-            &hdbs_state.persistence_connection,
-            screen_evt_id,
-            shared_types::synthesis_permission::SynthesisPermission::merge(
-                response.results.iter().map(|r| r.synthesis_permission),
-            ),
+    // Verification is CPU-heavy; keep it off the async workers.
+    let hashes_for_verify = hashes.clone();
+    let statement = tokio::task::spawn_blocking(move || {
+        zk.verifier.verify(
+            &proof,
+            &hashes_for_verify,
+            zk.trusted_active_security_key.as_ref(),
         )
-        .await
-        {
-            error!(
-                "Failed to persist screening result for {}: {e}",
-                client_state.open_request.client_mid()
-            );
-        }
-    }
+    })
+    .await
+    .map_err(|e| invalid(anyhow::anyhow!("verifier task failed: {e}")))?
+    .map_err(|e| {
+        warn!("{request_id}: rejected zk proof: {e}");
+        invalid(e.into())
+    })?;
+    info!(
+        "{request_id}: zk proof verified (order commitment {})",
+        hex::encode(statement.order_commitment)
+    );
 
-    let json = serde_json::to_string(&response)
-        .context("in screen serialization")
-        .map_err(ScepError::InternalError)?;
-
-    Ok(response::json(StatusCode::OK, json))
+    // Screen the verified hashes through the unmodified screening path.
+    parts.headers.insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static(TaggedHash::CONTENT_TYPE),
+    );
+    let request = Request::from_parts(parts, http_body_util::Full::new(hashes));
+    scep_endpoint_screen(request_id, hdbs_state, request).await
 }
 
-pub async fn scep_endpoint_screen(
+pub async fn scep_endpoint_screen<B>(
     request_id: &RequestId,
     hdbs_state: Arc<HdbServerState>,
-    request: Request<Incoming>,
-) -> Result<GenericResponse, scep::error::ScepError<scep::error::Screen>> {
+    request: Request<B>,
+) -> Result<GenericResponse, scep::error::ScepError<scep::error::Screen>>
+where
+    B: Body + Send + Sync + 'static,
+    B::Data: Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     check_content_type(request.headers(), TaggedHash::CONTENT_TYPE)
         .context("in screen")
         .map_err(scep::error::ScepError::InvalidMessage)?;

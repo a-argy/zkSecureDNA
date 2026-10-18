@@ -152,6 +152,23 @@ pub struct Config {
     )]
     #[serde(default = "Config::default_event_store_path")]
     pub event_store_path: PathBuf,
+
+    #[clap(
+        long,
+        help = "Accept zkSecureDNA screening proofs on /scep/screen-and-verify.",
+        env = "SECUREDNA_HDBSERVER_ZK_VERIFY",
+        default_value_t = false
+    )]
+    #[serde(default)]
+    pub zk_verify: bool,
+
+    #[clap(
+        long,
+        help = "Hex digest (zk_types::active_security_key_digest) of the trusted active-security key. If set, zk proofs made with any other key are rejected.",
+        env = "SECUREDNA_HDBSERVER_ZK_ACTIVE_SECURITY_KEY_DIGEST"
+    )]
+    #[serde(default)]
+    pub zk_active_security_key_digest: Option<String>,
 }
 
 impl Config {

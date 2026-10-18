@@ -13,7 +13,7 @@ use crate::retry_if;
 use crate::server_selection::{bad_flag::ServerBadFlag, SelectedHdb, SelectedKeyserver};
 use certificates::{DatabaseTokenGroup, ExemptionTokenGroup, KeyserverTokenGroup, TokenBundle};
 use doprf::party::{KeyserverId, KeyserverIdSet};
-use doprf::prf::{CompletedHashValue, HashPart, Query, VerificationInput};
+use doprf::prf::{CompletedHashValue, HashPart, Query};
 use doprf::tagged::TaggedHash;
 use http_client::BaseApiClient;
 use packed_ristretto::PackedRistrettos;
@@ -78,18 +78,18 @@ impl HdbClient {
         })
     }
 
-    /// Post packed `TaggedHash`es to the HDB, and return the HDB response set
+    /// Post packed `TaggedHash`es to the HDB, and return the HDB response set.
+    /// With a zkSecureDNA `proof`, uses `/scep/screen-and-verify` instead.
     pub async fn query(
         self,
         hashes: &PackedRistrettos<TaggedHash>,
-        hdb_verification_input: VerificationInput,
+        proof: Option<&[u8]>,
     ) -> Result<HdbScreeningResult, DoprfError> {
         let hash_total_count = hashes
             .len()
             .try_into()
             .map_err(|_| DoprfError::SequencesTooBig)?;
 
-        // Step 1: Authentication
         retry_with_timeout_and_mark_bad(
             || async {
                 Ok(self
@@ -98,19 +98,19 @@ impl HdbClient {
                     .await?)
             },
             &self.server.bad_flag,
-        ).await?;
+        )
+        .await?;
 
-        // Step 2: Actual screening query (with verification)
         retry_with_timeout_and_mark_bad(
-            || async { Ok(self.client.screen_and_verify(hashes, hdb_verification_input.clone()).await?) },
+            || async {
+                Ok(match proof {
+                    Some(proof) => self.client.screen_and_verify(hashes, proof).await?,
+                    None => self.client.screen(hashes).await?,
+                })
+            },
             &self.server.bad_flag,
-        ).await
-
-        // // Step 2: Actual screening query (without verification)
-        // retry_with_timeout_and_mark_bad(
-        //     || async { Ok(self.client.screen(hashes).await?) },
-        //     &self.server.bad_flag,
-        // ).await
+        )
+        .await
     }
 
     /// Post packed `CompletedHashValue`s to the HDB, and return the HDB response set

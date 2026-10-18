@@ -8,10 +8,10 @@ edition = "2021"
 [features]
 default = ["centralized_keygen"]
 centralized_keygen = []
+# Generate zkSecureDNA proofs while screening (native only); see docs/ZK-DESIGN.md.
+zk = ["dep:zk_prover", "dep:zk_types", "dep:anyhow"]
 
 [dependencies]
-# SP1 'script dependencies'
-sp1-sdk = { version = "3.0.0" }
 again = { workspace = true }
 async-trait = "0.1.73"
 bytes = "1"
@@ -27,8 +27,8 @@ tokio = { version = "1", default-features = false }
 tracing = { workspace = true }
 
 certificates = { path = "../certificates" }
-doprf = { path = "../doprf", default-features = true, features = ["sp1"] }
-http_client = { path = "../http_client", default-features = false}
+doprf = { path = "../doprf" }
+http_client = { path = "../http_client" }
 packed_ristretto = { path = "../packed_ristretto", default-features = false }
 quickdna = { workspace = true, default-features = false }
 scep = { path = "../scep" }
@@ -41,6 +41,9 @@ reqwest = { version = "0.12.5", features = ["cookies", "json"] }
 tokio = { version = "1", default-features = false, features = ["full"] }
 
 streamed_ristretto = { path = "../streamed_ristretto", features = ["reqwest"] }
+zk_prover = { path = "../zk_prover", optional = true }
+anyhow = { version = "1.0.75", optional = true }
+zk_types = { path = "../zk_types", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 futures-timer = { version = "3.0.2", features = ["wasm-bindgen"] }
@@ -75,8 +78,3 @@ quickdna = { workspace = true, default-features = false, features = [
 ] }
 tracing.workspace = true
 tracing-subscriber = "0.3.18"
-
-# added build dependencies
-[build-dependencies]
-sp1-helper = "3.0.0"
-sp1-build = "3.0.0"

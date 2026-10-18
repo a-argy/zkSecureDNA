@@ -130,7 +130,7 @@ async fn reconfigure(
         yubico_api_secret_key: app_cfg.yubico_api_secret_key,
     };
 
-    let persistence_connection = if let Some(prev_state) = prev_state {
+    let persistence_connection = if let Some(prev_state) = &prev_state {
         if app_cfg.event_store_path != prev_state.persistence_path {
             return Err(anyhow::anyhow!(
                 "Changes to event_store_path not supported: expected {:?}, but found {:?}",
@@ -144,6 +144,31 @@ async fn reconfigure(
         crate::event_store::open_db(&app_cfg.event_store_path)
             .await
             .context("opening event_store db")?
+    };
+
+    let zk = if !app_cfg.zk_verify {
+        None
+    } else if let Some(zk) = prev_state.as_ref().and_then(|s| s.zk.clone()) {
+        // Verifier setup derives verifying keys from the circuits; reuse on reload.
+        Some(zk)
+    } else {
+        let trusted_active_security_key = app_cfg
+            .zk_active_security_key_digest
+            .as_deref()
+            .map(|h| -> anyhow::Result<_> {
+                let bytes = hex::decode(h).context("zk active security key digest is not hex")?;
+                bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("zk active security key digest must be 32 bytes"))
+            })
+            .transpose()?;
+        let verifier = zk_prover::ScreeningVerifier::new()
+            .await
+            .context("setting up zk verifier")?;
+        Some(Arc::new(crate::state::ZkState {
+            verifier,
+            trusted_active_security_key,
+        }))
     };
 
     Ok(Arc::new(HdbServerState {
@@ -169,6 +194,7 @@ async fn reconfigure(
         exemptions_roots,
         persistence_path: app_cfg.event_store_path,
         persistence_connection,
+        zk,
     }))
 }
 

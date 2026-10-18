@@ -12,8 +12,8 @@ use crate::server_version_handler::LastServerVersionHandler;
 use crate::windows::Windows;
 use certificates::{ExemptionTokenGroup, TokenBundle};
 use doprf::active_security::ActiveSecurityKey;
-use doprf::party::{KeyserverIdSet, KeyserverId};
-use doprf::prf::{Query, QueryStateSet, SerializableQueryStateSet, HashPart, VerificationInput};
+use doprf::party::KeyserverIdSet;
+use doprf::prf::Query;
 use doprf::tagged::{HashTag, TaggedHash};
 use http_client::BaseApiClient;
 use packed_ristretto::{PackableRistretto, PackedRistrettos};
@@ -24,13 +24,8 @@ use shared_types::hash::HashSpec;
 use shared_types::hdb::HdbScreeningResult;
 use shared_types::requests::RequestContext;
 use shared_types::requests::RequestId;
-use shared_types::requests::SerializableRequestContext;
 use shared_types::synthesis_permission::Region;
 use tracing::{debug, info};
-use sp1_sdk::{
-    include_elf, HashableKey, ProverClient, SP1Proof, SP1ProofWithPublicValues, SP1Stdin,
-    SP1VerifyingKey,
-};
 
 pub struct DoprfConfig<'a, S> {
     pub api_client: &'a BaseApiClient,
@@ -279,13 +274,14 @@ impl<'a, S> DoprfClient<'a, S> {
         )
     }
 
-    async fn hash<R>(&self, windows: &DoprfWindows) -> Result<(PackedRistrettos<R>, VerificationInput), DoprfError>
+    /// Connect to the chosen keyservers to hash the given windows.
+    async fn hash<R>(&self, windows: &DoprfWindows) -> Result<PackedRistrettos<R>, DoprfError>
     where
         R: From<TaggedHash> + PackableRistretto + 'static,
         <R as PackableRistretto>::Array: Send + 'static,
     {
         if windows.combined_windows.is_empty() {
-            return Err(DoprfError::SequencesTooBig);
+            return Ok(PackedRistrettos::new(vec![]));
         }
 
         // add one for active security checksum
@@ -294,8 +290,7 @@ impl<'a, S> DoprfClient<'a, S> {
             .checked_add(1)
             .ok_or(DoprfError::SequencesTooBig)?;
 
-        // added 'inputs' return value for recursive proof
-        let (querystate, inputs) = make_keyserver_querysets(
+        let querystate = make_keyserver_querysets(
             self.config.request_ctx,
             &windows.combined_windows,
             self.keyserver_threshold as usize,
@@ -311,94 +306,82 @@ impl<'a, S> DoprfClient<'a, S> {
         let querying_duration = now.elapsed();
         debug!("Querying key servers done. Took: {:.2?}", querying_duration);
 
-        const VERIFICATION_ELF: &[u8] = include_bytes!("../../../verification_proof/elf/riscv32im-succinct-zkvm-elf");
+        incorporate_responses_and_hash(self.config.request_ctx, querystate, keyserver_responses)
+            .await
+    }
 
-        // Initialize the proving client.
-        let client = ProverClient::new();
-        // Setup the proving and verifying keys.
-        let (verification_pk, verification_vk) = client.setup(VERIFICATION_ELF);
+    /// Like [`Self::hash`], but also produces a zkSecureDNA screening proof
+    /// when `ZK_PROOF_MODE` is `execute` or `prove`. Returns the encoded proof
+    /// (only in `prove` mode) to attach to the HDB request.
+    #[cfg(feature = "zk")]
+    async fn hash_with_proof(
+        &self,
+        windows: &DoprfWindows,
+    ) -> Result<(PackedRistrettos<TaggedHash>, Option<Vec<u8>>), DoprfError> {
+        use crate::operations::make_keyserver_querysets_with_witness;
+        use zk_prover::{ClientProver, ProofMode};
 
-        let mut stdin = SP1Stdin::new();
-
-        // Write the verification keys: recursive proof
-        let vkeys = inputs.iter().map(|input| input.vk.hash_u32()).collect::<Vec<_>>();
-        stdin.write::<Vec<[u32; 8]>>(&vkeys);
-
-        // Write the public values: recursive proof
-        let public_values_write =
-            inputs.iter().map(|input| input.proof.public_values.to_vec()).collect::<Vec<_>>();
-        stdin.write::<Vec<Vec<u8>>>(&public_values_write);
-
-        // Write the proofs: recursive proof
-        //
-        // Note: this data will not directly read by the aggregation program, instead it will be
-        // witnessed by the prover during the recursive aggregation process inside SP1 itself.
-        for input in inputs {
-            let SP1Proof::Compressed(proof) = input.proof.proof else { panic!() };
-            stdin.write_proof(*proof, input.vk.vk);
+        let mode = ProofMode::from_env();
+        if mode == ProofMode::Off || windows.combined_windows.is_empty() {
+            return Ok((self.hash(windows).await?, None));
         }
+        let zk_err = |e: anyhow::Error| DoprfError::ZkError(format!("{e:#}"));
 
-        // Write values needed to incorporate responses and hash
-        stdin.write::<SerializableQueryStateSet>(&querystate.to_serializable_set());
-        stdin.write::<Vec<(KeyserverId, PackedRistrettos<HashPart>)>>(&keyserver_responses);
-        stdin.write::<SerializableRequestContext>(&self.config.request_ctx.to_serializable_request_context());
+        // add one for active security checksum
+        let hash_total_count = windows
+            .count
+            .checked_add(1)
+            .ok_or(DoprfError::SequencesTooBig)?;
 
-        // DEBUGGING SECTION START
-        // Execute the verification_proof program using the `ProverClient.execute` method,
-        let (mut public_values, execution_report) = client.execute(VERIFICATION_ELF, stdin.clone()).run().unwrap();
-        println!(
-            "Verification program executed with {} cycles",
-            execution_report.total_instruction_count() + execution_report.total_syscall_count()
+        let (querystate, witness) = make_keyserver_querysets_with_witness(
+            self.config.request_ctx,
+            &windows.combined_windows,
+            self.keyserver_threshold as usize,
+            &self.active_security_key,
         );
 
-        // Read the public values
-        let verified_status = public_values.read::<bool>();
-        println!("Verificationation Proof: Recursive proof return value --> {:?}", verified_status);
-        let proof_tagged_hash = public_values.read::<PackedRistrettos<TaggedHash>>();
+        let prover = ClientProver::global().await.map_err(zk_err)?;
+        let ks = self.connect_to_keyservers().await?;
 
-        let local_tagged_hash: PackedRistrettos<TaggedHash> = incorporate_responses_and_hash(self.config.request_ctx, querystate, keyserver_responses)
-            .await?;
+        // Prove the queries were built correctly while the keyservers work.
+        let now = get_now();
+        let querystate_ristrettos = PackedRistrettos::<Query>::from(&querystate);
+        let (query_proofs, keyserver_responses) = futures::join!(
+            prover.prove_queries(mode, &witness, &self.active_security_key),
+            ks.query(hash_total_count, &querystate_ristrettos),
+        );
+        let (query_proofs, keyserver_responses) =
+            (query_proofs.map_err(zk_err)?, keyserver_responses?);
+        debug!("Query proofs and keyservers done. Took: {:.2?}", now.elapsed());
 
-        if proof_tagged_hash.encoded_items() == local_tagged_hash.encoded_items() {
-            println!("Verificationation Proof: Incorporated responses match.");
-        } else {
-            println!("Verificationation Proof: Incorporated responses do not match.EDIT");
+        let screening = prover
+            .prove_screening(
+                mode,
+                query_proofs,
+                &querystate.to_serializable_set(),
+                &keyserver_responses,
+            )
+            .await
+            .map_err(zk_err)?;
+
+        let hashes: PackedRistrettos<TaggedHash> =
+            incorporate_responses_and_hash(self.config.request_ctx, querystate, keyserver_responses)
+                .await?;
+
+        // The proof must be about the hashes we are about to send.
+        let local_digest = zk_types::hdb_hashes_digest(&zk_types::concat(hashes.iter_encoded()));
+        if screening.statement.hdb_hashes_digest != local_digest {
+            return Err(DoprfError::ZkError(
+                "proof statement does not match locally computed hashes".into(),
+            ));
         }
-        
-        let verification_proof = 
-            SP1ProofWithPublicValues::load("/client/output/verification_proof-with-pis.bin").expect("loading proof failed");
-        let hdb_verification_input = VerificationInput {
-            proof: verification_proof,
-            vk: verification_vk.clone(),
-        };
-        // DEBUGGING SECTION END
-
-        // // PROOF GENERATION
-        // // Generate the proof for the given program and input
-        // let (verification_pk, verification_vk) = client.setup(VERIFICATION_ELF);
-        // let mut verification_proof = client.prove(&verification_pk, stdin).run().unwrap();
-        // println!("generated proof");
-
-        // // Verify proof and public values
-        // client.verify(&verification_proof, &verification_vk).expect("verification failed");
-
-        // // Save the proof to file
-        // verification_proof.save("/client/output/verification_proof-with-pis.bin").expect("saving proof failed");
-
-        // let local_tagged_hash: PackedRistrettos<TaggedHash> = incorporate_responses_and_hash(self.config.request_ctx, querystate, keyserver_responses)
-        //     .await?;
-
-        // let hdb_verification_input = VerificationInput {
-        //     proof: verification_proof,
-        //     vk: verification_vk.clone(),
-        // };
-        // // PROOF GENERATION SECTION END
-        let packed_ristrettos: PackedRistrettos<R> = local_tagged_hash
-            .iter_decoded()
-            .map(|item| R::from(item.unwrap()))
-            .collect();
-
-        Ok((packed_ristrettos, hdb_verification_input))
+        info!(
+            "{}: zk {mode:?} done: statement {:?}, timings {:?}",
+            self.id(),
+            screening.statement,
+            screening.timings
+        );
+        Ok((hashes, screening.proof))
     }
 }
 
@@ -436,12 +419,16 @@ where
     }
 
     info!("{}: generated {} windows", client.id(), windows.count);
-    let (hashes, hdb_verification_input) = client.hash(&windows).await?;
+    #[cfg(feature = "zk")]
+    let (hashes, zk_proof) = client.hash_with_proof(&windows).await?;
+    #[cfg(not(feature = "zk"))]
+    let (hashes, zk_proof): (PackedRistrettos<TaggedHash>, Option<Vec<u8>>) =
+        (client.hash(&windows).await?, None);
 
     let mut response = match &client.config.ets {
         ets if !ets.is_empty() => {
             let et_windows = client.window(ets.iter().flat_map(|w| w.et.token.dna_sequences()))?;
-            let (et_hashes, _) = client.hash(&et_windows).await?;
+            let et_hashes = client.hash(&et_windows).await?;
             let now = get_now();
             let response = client
                 .hdb_client
@@ -453,7 +440,10 @@ where
         }
         _ => {
             let now = get_now();
-            let response = client.hdb_client.query(&hashes, hdb_verification_input).await?;
+            let response = client
+                .hdb_client
+                .query(&hashes, zk_proof.as_deref())
+                .await?;
             let hdb_duration = now.elapsed();
             debug!("Querying HDB done. Took: {:.2?}", hdb_duration);
             response

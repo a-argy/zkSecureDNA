@@ -121,3 +121,26 @@ pub fn concat<'a, const N: usize>(items: impl IntoIterator<Item = &'a [u8; N]>) 
     }
     out
 }
+
+/// Content type of a `/scep/screen-and-verify` request body.
+pub const SCREEN_AND_VERIFY_CONTENT_TYPE: &str = "application/x-zksecuredna-screen-v1";
+
+/// Request body: `len(hashes) as u32 LE ‖ hashes ‖ proof`, where `hashes` is
+/// exactly the body `/scep/screen` would receive.
+pub fn encode_screen_and_verify(hashes: &[u8], proof: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + hashes.len() + proof.len());
+    out.extend_from_slice(&(hashes.len() as u32).to_le_bytes());
+    out.extend_from_slice(hashes);
+    out.extend_from_slice(proof);
+    out
+}
+
+/// Inverse of [`encode_screen_and_verify`]: returns `(hashes, proof)`.
+pub fn decode_screen_and_verify(body: &[u8]) -> Option<(&[u8], &[u8])> {
+    let len = u32::from_le_bytes(body.get(..4)?.try_into().ok()?) as usize;
+    let rest = &body[4..];
+    if rest.len() < len {
+        return None;
+    }
+    Some(rest.split_at(len))
+}

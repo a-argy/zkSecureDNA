@@ -6,7 +6,7 @@ use crate::instant::get_now;
 use crate::progress::report_progress;
 use doprf::active_security::ActiveSecurityKey;
 use doprf::party::KeyserverId;
-use doprf::prf::{HashPart, QueryStateSet, VerificationInput};
+use doprf::prf::{HashPart, QueryStateSet};
 use doprf::tagged::{HashTag, TaggedHash};
 use packed_ristretto::{PackableRistretto, PackedRistrettos};
 
@@ -54,8 +54,7 @@ pub fn make_keyserver_querysets(
     sequences: &[(HashTag, impl AsRef<str> + Sync)],
     num_required_keyshares: usize,
     target: &ActiveSecurityKey,
-) -> (QueryStateSet, Vec<VerificationInput>) {
-
+) -> QueryStateSet {
     let now = get_now();
 
     assert!(!sequences.is_empty());
@@ -63,7 +62,7 @@ pub fn make_keyserver_querysets(
     report_progress(request_ctx);
 
     // initial querystateset of hashes, blinds keyservers from seeing original sequences
-    let (querystates, verification_inputs)  = QueryStateSet::from_iter(
+    let querystates = QueryStateSet::from_iter(
         sequences.iter().map(|(t, w)| (*t, w.as_ref().as_bytes())),
         num_required_keyshares,
         target.clone(),
@@ -73,7 +72,27 @@ pub fn make_keyserver_querysets(
 
     let setup_duration = now.elapsed();
     debug!("Setting up done. Took: {:.2?}", setup_duration);
-    (querystates, verification_inputs)
+    querystates
+}
+
+/// Like [`make_keyserver_querysets`], but also returns the private witness the
+/// zkSecureDNA circuits need.
+#[cfg(feature = "zk")]
+pub fn make_keyserver_querysets_with_witness(
+    request_ctx: &RequestContext,
+    sequences: &[(HashTag, impl AsRef<str> + Sync)],
+    num_required_keyshares: usize,
+    target: &ActiveSecurityKey,
+) -> (QueryStateSet, doprf::prf::QueryWitness) {
+    assert!(!sequences.is_empty());
+    report_progress(request_ctx);
+    let result = QueryStateSet::from_iter_with_witness(
+        sequences.iter().map(|(t, w)| (*t, w.as_ref().as_bytes())),
+        num_required_keyshares,
+        target.clone(),
+    );
+    report_progress(request_ctx);
+    result
 }
 
 /// Given a QueryStateSet, and a Vec of keyserver responses,

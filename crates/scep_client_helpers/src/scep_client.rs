@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::sync::Arc;
-use serde::Serialize;
+
 use crate::ClientCerts;
 use certificates::key_traits::CanLoadKey;
 use certificates::{
@@ -12,7 +12,7 @@ use certificates::{
 use doprf::prf::CompletedHashValue;
 use doprf::{
     party::{KeyserverId, KeyserverIdSet},
-    prf::{HashPart, Query, VerificationInput},
+    prf::{HashPart, Query},
     tagged::TaggedHash,
 };
 use http_client::{BaseApiClient, HttpError};
@@ -236,32 +236,20 @@ impl ScepClient<DatabaseTokenGroup> {
             .await
     }
 
+    /// Like [`Self::screen`], but attaches a zkSecureDNA screening proof that
+    /// the HDB verifies before screening. See docs/ZK-DESIGN.md.
     pub async fn screen_and_verify(
         &self,
         hashes: &PackedRistrettos<TaggedHash>,
-        hdb_verification_input: VerificationInput,
+        proof: &[u8],
     ) -> Result<HdbScreeningResult, HttpError> {
-        #[derive(serde::Serialize)]
-        struct RequestWithVerification {
-            ristretto_data: Vec<u8>,
-            verification: VerificationInput,
-        }
-
-        let ristretto_data: Vec<u8> = hashes
-        .iter_encoded()
-        .flatten()
-        .copied()
-        .collect();
-
-        let request = RequestWithVerification {
-            ristretto_data: ristretto_data,
-            verification: hdb_verification_input,
-        };
-
+        let hash_bytes: Vec<u8> = hashes.iter_encoded().flatten().copied().collect();
+        let body = zk_types::encode_screen_and_verify(&hash_bytes, proof);
         self.api_client
-            .json_json_post(
+            .bytes_json_post(
                 &format!("{}{}", self.domain, scep::SCREEN_AND_VERIFY_ENDPOINT),
-                &request,
+                body.into(),
+                zk_types::SCREEN_AND_VERIFY_CONTENT_TYPE,
             )
             .await
     }

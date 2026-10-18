@@ -36,6 +36,8 @@ pub enum DoprfError {
     CryptoError(#[from] QueryError),
     #[error("Hazard database responded with invalid record number. This is a bug.")]
     InvalidRecord,
+    #[error("zkSecureDNA proof generation failed: {0}")]
+    ZkError(String),
 }
 
 impl DoprfError {
@@ -50,6 +52,7 @@ impl DoprfError {
             Self::WindowsError { .. } => false,
             Self::DecodeError { .. } => false,
             Self::CryptoError { .. } => false,
+            Self::ZkError(_) => false,
             Self::InvalidRecord => false,
         }
     }

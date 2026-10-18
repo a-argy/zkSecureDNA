@@ -45,12 +45,16 @@ keyservers ─► DLEQ proofs ─┘                                │
 Synthetic orders, keyservers simulated in process with real keyshares,
 compressed proofs, SP1 6.9 (`crates/zk_prover/examples/bench.rs`):
 
-| Order (windows) | GPU: 1× NVIDIA L4 | Proof | HDB verify |
-|---|---|---|---|
-| 1 | 16.4 s | 1.27 MB | 60 ms |
-| 10 | 25.0 s | 1.27 MB | 59 ms |
-| 100 | 110 s | 1.27 MB | 60 ms |
-| 500 | 446 s | 1.27 MB | 60 ms |
+| Order (windows) | CPU: 32 vCPU (n2) | GPU: 1× NVIDIA L4 | Proof | HDB verify |
+|---|---|---|---|---|
+| 1 | 377 s | 16.4 s | 1.27 MB | 47–60 ms |
+| 10 | 491 s | 25.0 s | 1.27 MB | 47–60 ms |
+| 100 | 1,774 s | 110 s | 1.27 MB | 47–60 ms |
+| 500 | — | 446 s | 1.27 MB | 60 ms |
+
+On-chain record: the record circuit (1.78M cycles) wrapped in Groth16 gives a
+356-byte proof; `submitRecord` with SP1's v6.1.0 verifier costs 674,609 gas
+for a 3-field record.
 
 The full SecureDNA integration test (real keyservers and HDB in process, six
 screenings, every proof verified by the HDB) passes in 5.4 minutes on the

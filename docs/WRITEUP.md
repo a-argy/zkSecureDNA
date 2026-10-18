@@ -2,8 +2,6 @@
 
 *zkSecureDNA: zero-knowledge proofs for DNA synthesis screening*
 
-> Draft. Numbers marked ⟨…⟩ are filled from the final benchmark runs.
-
 ## The problem
 
 Screening DNA synthesis orders against a database of sequences of concern is
@@ -82,15 +80,21 @@ relative to an honest run, and the system must reject it.
 Measured on synthetic orders with keyservers simulated in process using real
 keyshares, SP1 6.9.
 
-| Order (windows) | CPU, 32 cores | GPU, 1× NVIDIA L4 | Proof size | Verify |
+| Order (windows) | CPU, 32 vCPU | GPU, 1× NVIDIA L4 | Proof size | Verify |
 |---|---|---|---|---|
-| 1 | ⟨…⟩ | ⟨…⟩ | ⟨…⟩ | ⟨…⟩ |
-| 10 | ⟨…⟩ | ⟨…⟩ | | |
-| 100 | ⟨…⟩ | ⟨…⟩ | | |
-| 500 | — | ⟨…⟩ | | |
+| 1 | 377 s | 16.4 s | 1.27 MB | ~50 ms |
+| 10 | 491 s | 25.0 s | 1.27 MB | ~50 ms |
+| 100 | 1,774 s | 110 s | 1.27 MB | ~50 ms |
+| 500 | — | 446 s | 1.27 MB | ~60 ms |
 
-Record circuit: ⟨…⟩ cycles. On-chain `submitRecord` with the real Groth16
-proof: ⟨…⟩ gas.
+A mid-range data-centre GPU is 16–23× faster than 32 CPU cores. Proof size
+and verification time are constant. The full SecureDNA integration test (six
+screenings against real in-process keyservers and HDB, each proof verified)
+takes 5.4 minutes on the GPU.
+
+The record circuit is 1.78M cycles. Wrapped in Groth16 its proof is 356
+bytes, and `submitRecord` with SP1's on-chain verifier costs 674,609 gas for
+a 3-field record.
 
 The keyserver proofs are the largest single cost inside the aggregation
 circuit (about 3.7M → 17.6M cycles for a one-window order). Batching

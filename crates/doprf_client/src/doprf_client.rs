@@ -67,7 +67,6 @@ impl<'a, S> DoprfConfig<'a, S> {
     }
 }
 
-#[derive(Debug)]
 /// A screening proof waiting for the HDB's attestation.
 struct PendingReceipt {
     statement: zk_types::ScreeningStatement,
@@ -104,6 +103,7 @@ impl PendingReceipt {
     }
 }
 
+#[derive(Debug)]
 pub struct DoprfOutput {
     /// The number of hashes sent to the HDB
     pub n_hashes: u64,

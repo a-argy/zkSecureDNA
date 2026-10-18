@@ -54,7 +54,14 @@ impl ActiveSecurityKey {
     }
 
     /// To validate the keyserver responses we create a target unknown to the keyservers.
-    pub fn randomized_target(&self, random_modifier: Scalar) -> RandomizedTarget {
+    pub fn randomized_target(&self) -> RandomizedTarget {
+        self.randomized_target_with_modifier(Scalar::random(&mut OsRng))
+    }
+
+    /// Builds the target from a given modifier. Only for re-deriving a target
+    /// inside a zk circuit from its private witness; the modifier must be fresh
+    /// and kept from keyservers, so production code uses [`Self::randomized_target`].
+    pub fn randomized_target_with_modifier(&self, random_modifier: Scalar) -> RandomizedTarget {
         let target = Target(self.0[0] * random_modifier);
 
         RandomizedTarget {
@@ -62,6 +69,11 @@ impl ActiveSecurityKey {
             target,
             commitments: self.0.clone(),
         }
+    }
+
+    /// Compressed public commitments, for digesting into zk statements.
+    pub fn commitment_bytes(&self) -> Vec<[u8; 32]> {
+        self.0.iter().map(|c| c.compress().to_bytes()).collect()
     }
 
     /// The active security key supports a quorum that is equal to the number of commitments it holds internally
@@ -225,38 +237,34 @@ impl Display for InvalidSecretAndKeyshareInput {
     }
 }
 
-/// Randomised target is a modification of the established target
+/// Serializable form of [`RandomizedTarget`], for passing into the zk circuits.
+///
+/// Only the modifier and the public commitments are carried; the target is
+/// always recomputed as `commitments[0] * random_modifier`, so a prover cannot
+/// substitute a target that would let invalid keyserver responses validate.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SerializableRandomizedTarget {
     pub random_modifier: [u8; 32],
-    target: [u8; 32],
     commitments: Vec<[u8; 32]>,
 }
 
 impl SerializableRandomizedTarget {
-    pub fn to_randomized_target(&self) -> RandomizedTarget {
-        let random_modifier = Scalar::from_canonical_bytes(self.random_modifier);
-        if random_modifier.is_none().into() {
-            panic!("Invalid scalar! {:?}", self.random_modifier);
-        }
-        RandomizedTarget {
-            random_modifier: random_modifier.unwrap(),            // JUMP
-            target: Target(CompressedRistretto::from_slice(&self.target).expect("couldn't get bytes").decompress().expect("couldn't decompress")),
-            commitments: self.commitments
+    pub fn to_randomized_target(&self) -> Result<RandomizedTarget, DecodeError> {
+        let random_modifier = Option::<Scalar>::from(Scalar::from_canonical_bytes(self.random_modifier))
+            .ok_or(DecodeError::InvalidScalar)?;
+        let commitments = self
+            .commitments
             .iter()
-            .map(|c| {
-                CompressedRistretto::from_slice(c)
-                    .expect("couldn't get bytes")
-                    .decompress()
-                    .expect("couldn't decompress")
-            })
-            .collect(),
+            .map(|c| CompressedRistretto(*c).decompress().ok_or(DecodeError::InvalidRistrettoPoint))
+            .collect::<Result<Vec<_>, _>>()?;
+        if commitments.is_empty() {
+            return Err(DecodeError::InvalidRistrettoPoint);
         }
+        Ok(ActiveSecurityKey(commitments).randomized_target_with_modifier(random_modifier))
     }
 }
 
 /// Randomised target is a modification of the established target
-// JUMP
 #[derive(Debug, Clone, Default)]
 pub struct RandomizedTarget {
     pub random_modifier: Scalar,
@@ -268,9 +276,13 @@ impl RandomizedTarget {
     pub fn to_serializable_randomized_target(&self) -> SerializableRandomizedTarget {
         SerializableRandomizedTarget {
             random_modifier: self.random_modifier.to_bytes(),
-            target: *self.target.0.compress().as_bytes(),
             commitments: self.commitments.iter().map(|c| *c.compress().as_bytes()).collect(),
         }
+    }
+
+    /// Compressed public commitments, for digesting into zk statements.
+    pub fn commitment_bytes(&self) -> Vec<[u8; 32]> {
+        self.commitments.iter().map(|c| c.compress().to_bytes()).collect()
     }
 
     pub fn get_checksum_point_for_validation(&self, point_sum: &RistrettoPoint) -> RistrettoPoint {

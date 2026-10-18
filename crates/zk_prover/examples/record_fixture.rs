@@ -118,6 +118,11 @@ async fn main() -> anyhow::Result<()> {
         windows: witness.windows.clone(),
     };
 
+    if let Ok(path) = std::env::var("RECEIPT_OUT") {
+        std::fs::write(&path, serde_json::to_vec(&receipt)?)?;
+        eprintln!("wrote receipt to {path}");
+    }
+
     // Committee (3 authorities, any 2 can open) and the record proof.
     let (committee_key, authority_shares) = deal_committee(2, 3);
     let committee_bytes = committee_key.compress().to_bytes();

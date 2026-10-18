@@ -38,6 +38,4 @@ out/
 # tsgen results
 **/all_bindings.ts
 
-# docker output
-client_output
 zk/target/

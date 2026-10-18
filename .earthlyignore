@@ -14,8 +14,6 @@
 !/frontend/
 !/test/certs
 
-!/hash_proof/
-
 # We need .git/ for vergen, but don't want LFS
 !/.git/
 /.git/lfs/

@@ -182,8 +182,9 @@ contract ZkSecureDNARegistryTest is Test {
             )
         );
         bytes[] memory f = _fields(1);
+        RecordPublicValues memory pv = _pv(f, keccak256("s"));
         vm.expectRevert(ZkSecureDNARegistry.UnknownScreener.selector);
-        _submit(_pv(f, keccak256("s")), f);
+        _submit(pv, f);
     }
 
     // ---- investigations -----------------------------------------------------
@@ -282,8 +283,9 @@ contract ZkSecureDNARegistryTest is Test {
         _govern(abi.encodeCall(ZkSecureDNARegistry.setCommitteeKey, (bytes32(uint256(5)))));
         assertEq(registry.getRecord(rid).committeeKey, COMMITTEE);
         bytes[] memory f = _fields(3);
+        RecordPublicValues memory pv = _pv(f, keccak256("s3"));
         vm.expectRevert(ZkSecureDNARegistry.WrongCommitteeKey.selector);
-        _submit(_pv(f, keccak256("s3")), f);
+        _submit(pv, f);
     }
 
     function test_authority_membership_and_threshold() public {

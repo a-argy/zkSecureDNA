@@ -169,6 +169,11 @@ impl ClientProver {
             .execute(pk.elf().clone(), stdin.clone())
             .deferred_proof_verification(deferred_proofs)
             .await?;
+        // A guest that panics (e.g. a failed binding assert) still returns a
+        // report; its nonzero exit code is the rejection.
+        if report.exit_code != 0 {
+            anyhow::bail!("circuit rejected its inputs (exit code {})", report.exit_code);
+        }
         let cycles = report.total_instruction_count() + report.total_syscall_count();
         let proof = match mode {
             ProofMode::Prove => Some(self.client.prove(pk, stdin).compressed().await?),
@@ -325,6 +330,9 @@ impl ClientProver {
             .client
             .execute(self.record_pk.elf().clone(), stdin.clone())
             .await?;
+        if report.exit_code != 0 {
+            anyhow::bail!("record circuit rejected its inputs (exit code {})", report.exit_code);
+        }
         let cycles = report.total_instruction_count() + report.total_syscall_count();
         let proof = match kind {
             RecordProofKind::Execute => Vec::new(),

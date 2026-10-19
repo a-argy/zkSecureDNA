@@ -150,6 +150,6 @@ proprietary data. The recipe here transfers directly:
 
 ## Credits
 
-Project concept and design: Neil Perry (with input from Dan ⟨full name⟩ on
+Project concept and design: Neil Perry (with input from Dan Boneh on
 the verifiable-PRF step). Architecture input: Sofiane. Upstream protocol and
 code: SecureDNA. Implementation: Anthony Argyropoulos.

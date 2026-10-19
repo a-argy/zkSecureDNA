@@ -11,7 +11,9 @@ struct RecordPublicValues {
     bytes32 orderCommitment;
     bytes32 activeSecurityKeyDigest;
     bytes32 hdbPublicKey;
+    bytes32 hdbRoot;
     uint32 hazardCount;
+    uint32 lookupHits;
     uint64 screenedAt;
     bytes32 committeeKey;
     bytes32[] fieldDigests;
@@ -22,7 +24,8 @@ struct RecordPublicValues {
 ///
 /// A lab submits a record: an SP1 proof that (a) an order was screened by a
 /// registered screening service following its protocol, (b) the service
-/// attested to the outcome, and (c) the record's fields (the screened sequence
+/// attested to the outcome, and proved every database lookup against a
+/// published root of its hazard database, and (c) the record's fields (the screened sequence
 /// windows plus metadata such as purpose and lab id) are encrypted to the
 /// authority committee's threshold key. Nothing in a record is readable by
 /// anyone, including any single authority.
@@ -44,6 +47,7 @@ contract ZkSecureDNARegistry {
         bytes32 hdbPublicKey; // Ed25519 key that signs attestations
         bytes32 activeSecurityKeyDigest; // pins the service's keyservers
         bytes32 circuitsDigest; // pins the screening circuits
+        address curator; // publishes the hazard database's Merkle trie roots
         bool active;
     }
 
@@ -53,7 +57,9 @@ contract ZkSecureDNARegistry {
         bytes32 statementDigest;
         bytes32 orderCommitment;
         bytes32 committeeKey;
+        bytes32 hdbRoot;
         uint32 hazardCount;
+        uint32 lookupHits; // screened hashes the lookup proofs found in the database
         uint64 screenedAt;
         uint64 submittedAt;
         bytes32[] fieldDigests;
@@ -103,6 +109,11 @@ contract ZkSecureDNARegistry {
     uint32 public threshold;
 
     mapping(bytes32 => Screener) internal _screeners;
+    /// When each hazard-database root was published, per screener (0 = never).
+    /// Every root ever published stays listed, so all labs and auditors see
+    /// the same database versions.
+    mapping(bytes32 => mapping(bytes32 => uint64)) public hdbRootPublishedAt;
+    mapping(bytes32 => mapping(bytes32 => bool)) public hdbRootRevoked;
 
     Record[] internal _records;
     mapping(bytes32 => bool) public statementUsed;
@@ -125,6 +136,7 @@ contract ZkSecureDNARegistry {
         bytes32 indexed screenerId,
         bytes32 statementDigest,
         uint32 hazardCount,
+        uint32 lookupHits,
         uint64 screenedAt,
         bytes[] encryptedFields
     );
@@ -141,6 +153,8 @@ contract ZkSecureDNARegistry {
         uint256 indexed caseId, uint32 indexed field, address indexed authority, bytes encryptedShare
     );
     event ScreenerSet(bytes32 indexed screenerId, string name, bool active);
+    event HdbRootPublished(bytes32 indexed screenerId, bytes32 indexed root);
+    event HdbRootRevoked(bytes32 indexed screenerId, bytes32 indexed root);
     event AuthorityAdded(address indexed authority, uint32 shareIndex, bytes32 shareKey);
     event AuthorityRemoved(address indexed authority);
     event ThresholdSet(uint32 threshold);
@@ -155,6 +169,8 @@ contract ZkSecureDNARegistry {
     error NotAuthority();
     error OnlyGovernance();
     error UnknownScreener();
+    error UnknownHdbRoot();
+    error NotCurator();
     error ScreenerMismatch(string what);
     error WrongCommitteeKey();
     error WrongFieldCount();
@@ -239,6 +255,9 @@ contract ZkSecureDNARegistry {
         if (pv.hdbPublicKey != s.hdbPublicKey) revert ScreenerMismatch("hdb key");
         if (pv.activeSecurityKeyDigest != s.activeSecurityKeyDigest) revert ScreenerMismatch("keyservers");
         if (pv.circuitsDigest != s.circuitsDigest) revert ScreenerMismatch("circuits");
+        if (hdbRootPublishedAt[screenerId][pv.hdbRoot] == 0 || hdbRootRevoked[screenerId][pv.hdbRoot]) {
+            revert UnknownHdbRoot();
+        }
         if (pv.committeeKey != committeeKey) revert WrongCommitteeKey();
         if (pv.screenedAt > block.timestamp + 5 minutes) revert ScreeningInFuture();
         if (pv.screenedAt + maxRecordAge < block.timestamp) revert ScreeningTooOld();
@@ -260,14 +279,18 @@ contract ZkSecureDNARegistry {
                 statementDigest: pv.statementDigest,
                 orderCommitment: pv.orderCommitment,
                 committeeKey: pv.committeeKey,
+                hdbRoot: pv.hdbRoot,
                 hazardCount: pv.hazardCount,
+                lookupHits: pv.lookupHits,
                 screenedAt: pv.screenedAt,
                 submittedAt: uint64(block.timestamp),
                 fieldDigests: pv.fieldDigests
             })
         );
         _recordsByLab[msg.sender].push(recordId);
-        emit RecordSubmitted(recordId, msg.sender, screenerId, pv.statementDigest, pv.hazardCount, pv.screenedAt, encryptedFields);
+        emit RecordSubmitted(
+            recordId, msg.sender, screenerId, pv.statementDigest, pv.hazardCount, pv.lookupHits, pv.screenedAt, encryptedFields
+        );
     }
 
     function recordCount() external view returns (uint256) {
@@ -285,6 +308,20 @@ contract ZkSecureDNARegistry {
 
     function getScreener(bytes32 screenerId) external view returns (Screener memory) {
         return _screeners[screenerId];
+    }
+
+    /// @notice Publish a root of the screener's hazard database (its Merkle
+    /// trie, crates/hdb_trie). Records can only use published roots. The
+    /// curator vouches that the root is the real database: anyone holding the
+    /// database can rebuild the root and check it.
+    function publishHdbRoot(bytes32 screenerId, bytes32 root) external {
+        Screener storage s = _screeners[screenerId];
+        if (!s.active) revert UnknownScreener();
+        if (msg.sender != s.curator) revert NotCurator();
+        if (hdbRootPublishedAt[screenerId][root] == 0) {
+            hdbRootPublishedAt[screenerId][root] = uint64(block.timestamp);
+            emit HdbRootPublished(screenerId, root);
+        }
     }
 
     function authorities() external view returns (address[] memory) {
@@ -414,6 +451,12 @@ contract ZkSecureDNARegistry {
     function setScreener(bytes32 screenerId, Screener calldata screener) external onlyGovernance {
         _screeners[screenerId] = screener;
         emit ScreenerSet(screenerId, screener.name, screener.active);
+    }
+
+    /// Withdraws a root (e.g. a database later found to be missing entries).
+    function revokeHdbRoot(bytes32 screenerId, bytes32 root) external onlyGovernance {
+        hdbRootRevoked[screenerId][root] = true;
+        emit HdbRootRevoked(screenerId, root);
     }
 
     function addAuthority(address account, uint32 shareIndex, bytes32 shareKey) external onlyGovernance {

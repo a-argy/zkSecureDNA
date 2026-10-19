@@ -51,12 +51,14 @@ A record on chain carries a proof of this statement:
 > service's keyservers answered them, each proving its answers used its
 > published keyshare; the answers passed SecureDNA's active-security check;
 > the resulting hashes were screened by the registered hazard database, which
-> verified all of the above and signed the outcome; and the record's fields
+> verified all of the above and signed the outcome; each hash's lookup is
+> proven against a published root of that database, so how many of them it
+> contains is proven, not just reported; and the record's fields
 > are encryptions of those windows and the stated metadata to the authority
 > committee's key.
 
 The registry contract checks the proof and pins the service's database key,
-its keyserver key and its circuits. It refuses replays, stale screenings and
+its keyserver key, its circuits and the published roots of its database. It refuses replays, stale screenings and
 ciphertexts that do not match the proof. Opening any field of any record
 needs a threshold of authorities. Their approval is a public event naming
 the lab, so every opening is visible.
@@ -78,8 +80,15 @@ Most of the work was in those links rather than in any one circuit:
    needed. This is the standard verifiable-PRF construction.
 4. **Hashes to the database query.** The database verifies the proof against
    the exact bytes it is asked to screen, then signs its result.
-5. **Record to everything above.** The record circuit verifies the screening
-   proof and the database's signature, opens the commitment, and produces
+5. **Lookups to the database.** The database keeps its entries in a Merkle
+   trie, keyed by the bits of each hash, and its curator publishes the root
+   on chain. For every hash screened, the database returns the path its bits
+   spell out, which ends either at that hash's entry or somewhere it is
+   provably absent. Following a suggestion from Dan Boneh, this replaces
+   "trust the database's answer" with a proof against a root anyone holding
+   the database can rebuild.
+6. **Record to everything above.** The record circuit verifies the screening
+   proof, the database's signature and every lookup proof, opens the commitment, and produces
    the encrypted fields, so the on-chain record cannot be detached from any of it.
 
 ### Lessons from v1
@@ -109,9 +118,33 @@ and verification time are constant. The full SecureDNA integration test (six
 screenings against real in-process keyservers and HDB, each proof verified)
 takes 5.4 minutes on the GPU.
 
-The record circuit is 1.78M cycles. Wrapped in Groth16 its proof is 356
-bytes, and `submitRecord` with SP1's on-chain verifier costs 674,609 gas for
-a 3-field record.
+The record circuit, now including the database lookup proofs, is 1.87M
+cycles for the fixture order. Wrapped in Groth16 its proof is 356 bytes, and
+`submitRecord` with SP1's on-chain verifier costs 668,856 gas for a 3-field
+record.
+
+**Database lookup proofs.** Synthetic databases of random entries
+(`hdbtrie bench`, `examples/lookup_bench.rs`); one lookup proof per hash
+screened, checked inside the record circuit:
+
+| Database entries | Build trie | Mean path | Proof size | Check one proof (native) |
+|---|---|---|---|---|
+| 1M | 0.5 s | 20.6 | 705 B | 16 µs |
+| 10M | 4.7 s | 23.9 | 810 B | 19 µs |
+| 100M | 48 s | 27.2 | 916 B | 22 µs |
+
+| Order (hashes) | Record circuit, no lookups | + lookups, 1M-entry DB | + lookups, 100M-entry DB | Record proof, 100M DB (L4) | Lookup proofs sent |
+|---|---|---|---|---|---|
+| 1 | 1.78M cycles | 1.83M | 1.84M | 5.1 s | 0.9 KB |
+| 10 | 1.83M | 2.36M | 2.51M | 5.7 s | 8.8 KB |
+| 100 | 2.28M | 7.55M | 9.24M | 10.0 s | 89 KB |
+| 500 | 4.30M | 30.6M | 39.1M | 30.4 s | 444 KB |
+
+Each lookup costs about 70,000 cycles in the circuit, and the cost grows
+with the logarithm of the database size, so a 100× larger database adds
+about a third. A 500-hash order's record proof takes 30 s on the L4, small
+next to the 446 s screening proof. The integration test now also checks
+the real HDB's lookup proofs (hits included) and still passes in 5.4 minutes.
 
 The keyserver proofs are the largest single cost inside the aggregation
 circuit (about 3.7M → 17.6M cycles for a one-window order). Batching
@@ -120,11 +153,17 @@ Moving the check into accelerated precompiles is the obvious next optimization.
 
 ## What is still trusted
 
-- **The screening service.** The proofs show the protocol was followed with
-  the registered service's keys. They do not show the database catches
-  every hazardous sequence, including novel AI-designed ones. Better
-  detection is separate work. This project makes whatever detection exists
-  verifiable, and lets a better screener plug into the same registry.
+- **The database contents.** Lookups are proven against a published root,
+  so the service cannot misreport what its database holds. But the curator
+  vouches that the root is the real database, and nothing shows the
+  database catches every hazardous sequence, including novel AI-designed
+  ones. Better detection is separate work. This project makes whatever
+  detection exists verifiable, and lets a better screener plug into the
+  same registry.
+- **What the service does with a hit.** Exemptions, regional rules and
+  grouping hits into hazards still rest on the service's signature. The
+  record carries both the proven number of database hits and the signed
+  hazard count, so a gap between them is visible.
 - **Committee setup.** The prototype uses a trusted dealer. A deployment
   needs distributed key generation.
 - **Permanence.** Encrypted records on a public chain are permanent, and

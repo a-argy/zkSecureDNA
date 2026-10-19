@@ -114,6 +114,7 @@ pub async fn scep_endpoint_screen_and_verify(
 
     // Verification is CPU-heavy; keep it off the async workers.
     let hashes_for_verify = hashes.clone();
+    let trie = zk.trie.clone();
     let statement = tokio::task::spawn_blocking(move || {
         zk.verifier.verify(
             &proof,
@@ -140,6 +141,13 @@ pub async fn scep_endpoint_screen_and_verify(
     );
     let hdb_hashes_digest = statement.hdb_hashes_digest;
     let statement_digest = zk_prover::zk_types::statement_digest(&statement);
+    // A lookup proof for every hash, against the published database root, so
+    // the lab can show what the database holds without trusting this server.
+    let hashes_for_trie = hashes.clone();
+    let lookups = tokio::task::spawn_blocking(move || trie.lookups(&hashes_for_trie))
+        .await
+        .map_err(|e| invalid(anyhow::anyhow!("lookup task failed: {e}")))?
+        .ok_or_else(|| invalid(anyhow::anyhow!("hashes are not whole tagged hashes")))?;
     let request = Request::from_parts(parts, http_body_util::Full::new(hashes));
     let keypair = hdbs_state.scep.keypair.clone();
     let response = scep_endpoint_screen(request_id, hdbs_state, request).await?;
@@ -166,6 +174,7 @@ pub async fn scep_endpoint_screen_and_verify(
             .map(|d| d.as_secs())
             .unwrap_or_default(),
         hdb_public_key: keypair.public_key().to_bytes(),
+        hdb_root: lookups.root,
     };
     let signature = keypair.sign(&attestation.message());
     let response = zk_prover::zk_types::ScreenAndVerifyResponse {
@@ -174,6 +183,7 @@ pub async fn scep_endpoint_screen_and_verify(
             attestation,
             signature: signature.to_bytes().to_vec(),
         },
+        lookups,
     };
     let json = serde_json::to_string(&response)
         .map_err(|e| invalid(anyhow::anyhow!("encoding response: {e}")))?;

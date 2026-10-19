@@ -321,6 +321,8 @@ impl ClientProver {
         stdin.write(&metadata.to_vec());
         stdin.write(committee_key);
         stdin.write(&scalars.iter().map(|s| s.to_bytes()).collect::<Vec<_>>());
+        stdin.write(&receipt.hdb_hashes);
+        stdin.write(&receipt.lookups);
         let SP1Proof::Compressed(p) = &aggregate.proof else {
             anyhow::bail!("aggregation proof is not compressed");
         };

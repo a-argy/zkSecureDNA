@@ -3212,6 +3212,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdb_trie"
+version = "1.0.8"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "clap",
+ "rand 0.8.5",
+ "rayon",
+ "serde_json",
+ "tempfile",
+ "zk_types",
+]
+
+[[package]]
 name = "hdbserver"
 version = "1.0.8"
 dependencies = [
@@ -3223,6 +3237,7 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "hdb",
+ "hdb_trie",
  "hex",
  "http-body-util",
  "hyper 1.5.2",
@@ -10059,6 +10074,7 @@ dependencies = [
  "curve25519-dalek",
  "doprf",
  "ed25519-dalek",
+ "hdb_trie",
  "hex",
  "packed_ristretto",
  "rand 0.8.5",

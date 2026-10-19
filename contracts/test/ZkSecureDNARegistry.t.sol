@@ -15,12 +15,14 @@ contract ZkSecureDNARegistryTest is Test {
     address a2 = address(0xA2);
     address a3 = address(0xA3);
     address lab = address(0x1AB);
+    address curator = address(0xC0);
 
     bytes32 constant SCREENER = keccak256("securedna-main");
     bytes32 constant HDB_KEY = bytes32(uint256(0x11));
     bytes32 constant ASK = bytes32(uint256(0x22));
     bytes32 constant CIRCUITS = bytes32(uint256(0x33));
     bytes32 constant COMMITTEE = bytes32(uint256(0x44));
+    bytes32 constant ROOT = bytes32(uint256(0x55));
     uint32 constant FIELDS = 3;
 
     function setUp() public {
@@ -35,9 +37,11 @@ contract ZkSecureDNARegistryTest is Test {
         _govern(
             abi.encodeCall(
                 ZkSecureDNARegistry.setScreener,
-                (SCREENER, ZkSecureDNARegistry.Screener("SecureDNA", HDB_KEY, ASK, CIRCUITS, true))
+                (SCREENER, ZkSecureDNARegistry.Screener("SecureDNA", HDB_KEY, ASK, CIRCUITS, curator, true))
             )
         );
+        vm.prank(curator);
+        registry.publishHdbRoot(SCREENER, ROOT);
     }
 
     // ---- helpers ------------------------------------------------------------
@@ -69,7 +73,9 @@ contract ZkSecureDNARegistryTest is Test {
             orderCommitment: keccak256("order"),
             activeSecurityKeyDigest: ASK,
             hdbPublicKey: HDB_KEY,
+            hdbRoot: ROOT,
             hazardCount: 0,
+            lookupHits: 0,
             screenedAt: uint64(block.timestamp - 1 hours),
             committeeKey: COMMITTEE,
             fieldDigests: digests
@@ -96,6 +102,45 @@ contract ZkSecureDNARegistryTest is Test {
         assertEq(r.fieldDigests.length, FIELDS);
         assertEq(registry.recordsByLab(lab).length, 1);
         assertTrue(registry.statementUsed(keccak256("s1")));
+    }
+
+    function test_record_keeps_root_and_lookup_hits() public {
+        bytes[] memory f = _fields(1);
+        RecordPublicValues memory pv = _pv(f, keccak256("s1"));
+        pv.lookupHits = 2;
+        pv.hazardCount = 1;
+        ZkSecureDNARegistry.Record memory r = registry.getRecord(_submit(pv, f));
+        assertEq(r.hdbRoot, ROOT);
+        assertEq(r.lookupHits, 2);
+        assertEq(r.hazardCount, 1);
+    }
+
+    function test_only_curator_publishes_roots() public {
+        vm.expectRevert(ZkSecureDNARegistry.NotCurator.selector);
+        registry.publishHdbRoot(SCREENER, bytes32(uint256(0x66)));
+        vm.prank(curator);
+        vm.expectRevert(ZkSecureDNARegistry.UnknownScreener.selector);
+        registry.publishHdbRoot(keccak256("other"), bytes32(uint256(0x66)));
+        assertEq(registry.hdbRootPublishedAt(SCREENER, ROOT), block.timestamp);
+    }
+
+    function test_rejects_unpublished_or_revoked_root() public {
+        bytes[] memory f = _fields(1);
+        RecordPublicValues memory pv = _pv(f, keccak256("s"));
+        pv.hdbRoot = bytes32(uint256(0x66));
+        vm.expectRevert(ZkSecureDNARegistry.UnknownHdbRoot.selector);
+        _submit(pv, f);
+
+        _govern(abi.encodeCall(ZkSecureDNARegistry.revokeHdbRoot, (SCREENER, ROOT)));
+        pv = _pv(f, keccak256("s"));
+        vm.expectRevert(ZkSecureDNARegistry.UnknownHdbRoot.selector);
+        _submit(pv, f);
+    }
+
+    function test_revoking_roots_needs_governance() public {
+        vm.prank(curator);
+        vm.expectRevert(ZkSecureDNARegistry.OnlyGovernance.selector);
+        registry.revokeHdbRoot(SCREENER, ROOT);
     }
 
     function test_rejects_replayed_statement() public {
@@ -178,7 +223,7 @@ contract ZkSecureDNARegistryTest is Test {
         _govern(
             abi.encodeCall(
                 ZkSecureDNARegistry.setScreener,
-                (SCREENER, ZkSecureDNARegistry.Screener("SecureDNA", HDB_KEY, ASK, CIRCUITS, false))
+                (SCREENER, ZkSecureDNARegistry.Screener("SecureDNA", HDB_KEY, ASK, CIRCUITS, curator, false))
             )
         );
         bytes[] memory f = _fields(1);

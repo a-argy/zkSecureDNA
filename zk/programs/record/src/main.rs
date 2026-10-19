@@ -1,8 +1,11 @@
 //! Record circuit: the on-chain artifact (Neil's "zkp_all"). It
 //!   1. recursively verifies the aggregation proof (the screening statement),
 //!   2. verifies the HDB's Ed25519 attestation of that statement,
-//!   3. opens the order commitment against the actual windows, and
-//!   4. encrypts each record field (field 0 = the windows) to the authority
+//!   3. verifies a lookup proof for every hash the HDB screened, against the
+//!      database trie root it attested to (so "not in the database" is
+//!      proven, not just signed),
+//!   4. opens the order commitment against the actual windows, and
+//!   5. encrypts each record field (field 0 = the windows) to the authority
 //!      committee key, committing a digest per ciphertext.
 //! Public values are ABI-encoded for the Solidity registry.
 
@@ -14,8 +17,10 @@ use curve25519_dalek::scalar::Scalar;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use zk_escrow::{decompress, encode_windows, encrypt_field};
+use zk_types::trie::TrieLookups;
 use zk_types::{
-    circuits_digest, order_commitment, statement_digest, HdbAttestation, ScreeningStatement,
+    circuits_digest, hdb_hashes_digest, order_commitment, statement_digest, HdbAttestation,
+    ScreeningStatement,
 };
 
 sol! {
@@ -26,7 +31,9 @@ sol! {
         bytes32 orderCommitment;
         bytes32 activeSecurityKeyDigest;
         bytes32 hdbPublicKey;
+        bytes32 hdbRoot;
         uint32 hazardCount;
+        uint32 lookupHits;
         uint64 screenedAt;
         bytes32 committeeKey;
         bytes32[] fieldDigests;
@@ -44,6 +51,8 @@ pub fn main() {
     let metadata = sp1_zkvm::io::read::<Vec<Vec<u8>>>();
     let committee_key_bytes = sp1_zkvm::io::read::<[u8; 32]>();
     let ephemeral_scalars = sp1_zkvm::io::read::<Vec<[u8; 32]>>();
+    let hdb_hashes = sp1_zkvm::io::read::<Vec<u8>>();
+    let lookups = sp1_zkvm::io::read::<TrieLookups>();
 
     // 1. The screening statement, proven by the aggregation circuit.
     sp1_zkvm::lib::verify::verify_sp1_proof(
@@ -63,14 +72,25 @@ pub fn main() {
         .verify(&attestation.message(), &signature)
         .expect("HDB attestation signature does not verify");
 
-    // 3. The windows are the ones that were screened.
+    // 3. What the database holds for every screened hash, proven against the
+    //    root the HDB attested to. The registry checks that root was published
+    //    for this screener.
+    assert_eq!(
+        hdb_hashes_digest(&hdb_hashes),
+        statement.hdb_hashes_digest,
+        "hashes are not the ones screened"
+    );
+    assert_eq!(lookups.root, attestation.hdb_root, "lookups are for another database root");
+    let lookup_hits = lookups.verify(&hdb_hashes).expect("lookup proofs do not verify");
+
+    // 4. The windows are the ones that were screened.
     assert_eq!(
         order_commitment(&salt, windows.iter().map(Vec::as_slice)),
         statement.order_commitment,
         "windows do not open the order commitment"
     );
 
-    // 4. Encrypt every field to the committee key.
+    // 5. Encrypt every field to the committee key.
     let committee_key = decompress(&committee_key_bytes).expect("invalid committee key");
     let mut fields = vec![encode_windows(&windows)];
     fields.extend(metadata);
@@ -91,7 +111,9 @@ pub fn main() {
         orderCommitment: statement.order_commitment.into(),
         activeSecurityKeyDigest: statement.active_security_key_digest.into(),
         hdbPublicKey: attestation.hdb_public_key.into(),
+        hdbRoot: attestation.hdb_root.into(),
         hazardCount: attestation.hazard_count,
+        lookupHits: lookup_hits,
         screenedAt: attestation.timestamp,
         committeeKey: committee_key_bytes.into(),
         fieldDigests: field_digests.into_iter().map(Into::into).collect(),

@@ -21,6 +21,30 @@ Project concept by Neil Perry. Built on [SP1](https://github.com/succinctlabs/sp
 > Research prototype. Not audited. The authority committee uses a trusted
 > dealer, and the registry has not been deployed to a public network.
 
+## Why this matters
+
+SecureDNA keeps both the customer's order and the hazard database secret,
+but it produces no evidence: after screening, only the lab knows it
+screened. A regulator, insurer or the public must either trust the lab or
+audit it in a way that exposes orders or the database. zkSecureDNA gives
+the lab a record anyone can verify, showing it screened the real order with
+the real, registered service, while revealing nothing about the order.
+
+This is one instance of a general pattern that matters for AI governance as
+well: *proving a safety check was performed, on the real input, by the real
+checker, without handing over the sensitive data involved*. A developer
+might need to show that a required evaluation ran on the deployed model, by
+an approved evaluator, without revealing weights. The recipe is the same:
+commit to the private input, prove each step against keys the verifier
+pins, have the external checker sign what it saw, and bind it all into one
+artifact that authorities can open only jointly and publicly.
+
+What is still trusted: the screening service's database (the proofs show
+the protocol was followed, not that the database is complete), the
+committee setup (trusted dealer for now), and the permanence of encrypted
+records on a public chain. The full argument, including lessons from v1, is
+in the [write-up](docs/WRITEUP.md).
+
 ## What it proves
 
 ```

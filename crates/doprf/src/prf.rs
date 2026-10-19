@@ -1,17 +1,6 @@
 // Copyright 2021-2024 SecureDNA Stiftung (SecureDNA Foundation) <licensing@securedna.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// added packages for file write
-use serde_json;
-use std::fs::{self, File};
-use std::io::{self, Read, BufWriter};
-use std::path::Path;
-
-// added packages for SP1 'Script'
-use std::env;
-use clap::Parser;
-use sp1_sdk::{include_elf, utils, ProverClient, SP1Stdin, SP1ProofWithPublicValues, SP1VerifyingKey};
-
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -47,11 +36,6 @@ impl Query {
     pub fn hash_from_string(seq: &str) -> Self {
         Self(RistrettoPoint::hash_from_bytes::<Sha3_512>(seq.as_bytes()).compress())
     }
-
-    // Added Query method for sential value to be used in SP1
-    pub fn sentinel() -> Self {
-        Query(CompressedRistretto::default())
-    }
 }
 
 /// Response from a keyholder: (H(x)^r)^{f(i)*c_i}
@@ -71,6 +55,18 @@ impl KeyShare {
 
     pub fn apply_query_and_lagrange_coefficient(&self, q: Query, c: &Scalar) -> HashPart {
         HashPart::from_rp(c * self.0 * q.to_rp())
+    }
+
+    /// zkSecureDNA: proves `parts[j] = c * keyshare * queries[j]` for all `j`
+    /// (see [`crate::dleq`]). `c` is this keyserver's Lagrange coefficient.
+    pub fn prove_responses(
+        &self,
+        c: &Scalar,
+        domain: &[u8],
+        queries: &[[u8; 32]],
+        parts: &[[u8; 32]],
+    ) -> Result<crate::dleq::DleqProof, crate::dleq::DleqError> {
+        crate::dleq::prove(domain, &(c * self.0), queries, parts)
     }
 
     pub fn multiply_by_rp(&self, point: RistrettoPoint) -> RistrettoPoint {
@@ -225,14 +221,20 @@ impl fmt::Display for QueryError {
     }
 }
 
-/// An input to the aggregation program.
-///
-/// Consists of a proof and a verification key.
-// #[cfg(feature = "sp1")]
-#[derive(Serialize, Deserialize, Clone)]
-pub struct VerificationInput {
-    pub proof: SP1ProofWithPublicValues,
-    pub vk: SP1VerifyingKey,
+/// Private inputs to the zkSecureDNA hash and checksum circuits, captured
+/// while building a [`QueryStateSet`]. Never sent to keyservers or the HDB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryWitness {
+    /// The raw window bytes, in query order.
+    pub windows: Vec<Vec<u8>>,
+    /// Blinding factor of each window query, in query order.
+    pub blinding_factors: Vec<[u8; 32]>,
+    /// Compressed `sum(verification_factor_i * H(window_i))`.
+    pub sum: [u8; 32],
+    /// The fresh active-security random modifier for this screening.
+    pub random_modifier: [u8; 32],
+    pub checksum_verification_factor: [u8; 32],
+    pub checksum_blinding_factor: [u8; 32],
 }
 
 // Added this struct for serialization of QueryStateSet
@@ -244,26 +246,32 @@ pub struct SerializableQueryStateSet {
 
 impl SerializableQueryStateSet {
     /// Converts this serializable set back into a `QueryStateSet`.
-    pub fn to_query_state_set(&self) -> QueryStateSet {
-        QueryStateSet {
-            querystates: self.querystates
-                .iter()
-                .map(|(tag, sqs)| {
-                    let query_state = QueryState {
-                        required_keyholders: sqs.required_keyholders,
-                        blinding_factor: Scalar::from_bytes_mod_order(sqs.blinding_factor),
-                        verification_factor: Scalar::from_bytes_mod_order(sqs.verification_factor),
-                        query: sqs.query.clone(),
-                        responses: sqs.responses
-                            .iter()
-                            .map(|(k, part)| (*k, HashPart(CompressedRistretto::from_slice(part).expect("couldn't read bytes"))))
-                            .collect(),
-                    };
-                    (Some(HashTag::from_bytes(*tag)), query_state)
-                })
-                .collect(),
-            randomized_target: self.randomized_target.to_randomized_target(),
-        }
+    pub fn to_query_state_set(&self) -> Result<QueryStateSet, DecodeError> {
+        let decode_scalar = |bytes: [u8; 32]| {
+            Option::<Scalar>::from(Scalar::from_canonical_bytes(bytes)).ok_or(DecodeError::InvalidScalar)
+        };
+        let querystates = self
+            .querystates
+            .iter()
+            .map(|(tag, sqs)| {
+                let query_state = QueryState {
+                    required_keyholders: sqs.required_keyholders,
+                    blinding_factor: decode_scalar(sqs.blinding_factor)?,
+                    verification_factor: decode_scalar(sqs.verification_factor)?,
+                    query: sqs.query,
+                    responses: sqs
+                        .responses
+                        .iter()
+                        .map(|(k, part)| (*k, HashPart(CompressedRistretto(*part))))
+                        .collect(),
+                };
+                Ok((Some(HashTag::from_bytes(*tag)), query_state))
+            })
+            .collect::<Result<Vec<_>, DecodeError>>()?;
+        Ok(QueryStateSet {
+            querystates,
+            randomized_target: self.randomized_target.to_randomized_target()?,
+        })
     }
 }
 
@@ -274,210 +282,71 @@ pub struct QueryStateSet {
 }
 
 impl QueryStateSet {
-    #[cfg(feature = "sp1")]
     pub fn from_iter(
         iter: impl IntoIterator<Item = (HashTag, impl AsRef<[u8]>)>,
         required_keyholders: usize,
         active_security_key: ActiveSecurityKey,
-    ) -> (Self, Vec<VerificationInput>) {
-        // The ELF we want to execute inside the zkVM, ensure it's up to date (auto-build disabled)
-        const HASH_ELF: &[u8] = include_bytes!("../../../hash_proof/elf/riscv32im-succinct-zkvm-elf");
-        const CHECKSUM_ELF: &[u8] = include_bytes!("../../../checksum_proof/elf/riscv32im-succinct-zkvm-elf");
+    ) -> Self {
+        Self::from_iter_with_witness(iter, required_keyholders, active_security_key).0
+    }
 
-        // The input stream that the program will read from using `sp1_zkvm::io::read`. Note that the
-        // types of the elements in the input stream must match the types being read in the program.
-        let mut hash_stdin = SP1Stdin::new();
-        let mut checksum_stdin = SP1Stdin::new();
+    /// Like [`Self::from_iter`], but also returns the private values the
+    /// zkSecureDNA circuits need to prove the queries were built correctly.
+    pub fn from_iter_with_witness(
+        iter: impl IntoIterator<Item = (HashTag, impl AsRef<[u8]>)>,
+        required_keyholders: usize,
+        active_security_key: ActiveSecurityKey,
+    ) -> (Self, QueryWitness) {
+        let randomized_target = active_security_key.randomized_target();
 
         let iter = iter.into_iter();
         let estimated_size = iter.size_hint().0 + 1;
         let mut querystates = Vec::with_capacity(estimated_size);
+        let mut windows = Vec::with_capacity(estimated_size);
         let mut sum = RistrettoPoint::identity();
 
         let verification_factor_max = 2u32.pow(SECURITY_PARAMETER);
         let mut rng = OsRng;
-
-        // Concatenate all queries forrandom random_modifier
-        let mut concat_queries = Vec::new();
-
         for (tag, b) in iter {
-            let byte_vec = b.as_ref().to_vec();
-            // Write these bytes to the input stream
-            hash_stdin.write(&byte_vec);
-
             let point = RistrettoPoint::hash_from_bytes::<Sha3_512>(b.as_ref());
             let verification_factor = Scalar::from(rng.gen_range(0u32..=verification_factor_max));
-
             // We need variable time scalar * point multiplication; this is the fastest option provided by curve25519-dalek
             sum += RistrettoPoint::vartime_double_scalar_mul_basepoint(
                 &verification_factor,
                 &point,
                 &Scalar::ZERO,
             );
-            
             let state = QueryState::from_rp(point, required_keyholders, verification_factor);
-            
-            // Retrieve the random blinding factor generated in from_rp, convert to 
-            // a serializable type and write it
-            hash_stdin.write(&state.blinding_factor.as_bytes());
-
-            // Concatenate all queries
-            concat_queries.extend_from_slice(state.query.0.as_bytes());
-
+            windows.push(b.as_ref().to_vec());
             querystates.push((Some(tag), state));
         }
-
-        // After writing all byte arrays, write a sentinel value
-        let sentinel: Vec<u8> = Vec::new();
-        hash_stdin.write(&sentinel);
-
-        // Create a `ProverClient` method
-        let client = ProverClient::new();
-
-        // DEBUGGING SECTION START
-        // Execute the hash_proof program using the `ProverClient.execute` method,
-        let (mut hash_public_values, execution_report) = client.execute(HASH_ELF, hash_stdin.clone()).run().unwrap();
-        println!(
-            "Hash program executed with {} cycles",
-            execution_report.total_instruction_count() + execution_report.total_syscall_count()
-        );
-
-        // Read the proof hashes from the output stream until sentinel value is reached
-        let mut proof_quries = Vec::with_capacity(estimated_size);
-        let sentinel = Query::sentinel();
-
-        loop {
-            let read_val = hash_public_values.read::<Query>();
-            if read_val == sentinel {
-                break;
-            }
-            proof_quries.push(read_val)
-        }
-
-        // Extract only queries from querystates states
-        let local_queries: Vec<Query> = querystates.iter().map(|(_, state)| state.query.clone()).collect();
-
-        // Confirm matching outputs, for debugging
-        if proof_quries == local_queries {
-            println!("Hash proof: Hashes match.");
-        } else {
-            println!("Hash proof: Hashes do not match.");
-        }   
-
-        // // Determine if the program is using the precompiles
-        // for (code, count) in &(*execution_report.syscall_counts) {
-        //     println!("Syscall {code:?} was called {count} times");
-        // }
-
-        // Read in previously generated proof to avoid unecessary computation
-        let (hash_pk, hash_vk) = client.setup(HASH_ELF);
-        let deserialized_hash_proof =
-            SP1ProofWithPublicValues::load("/client/output/hash_proof-with-pis.bin").expect("loading proof failed");
-        let input_1 = VerificationInput {
-                proof: deserialized_hash_proof,
-                vk: hash_vk.clone(),
-        };
-        // DEBUGGING SECTION END
-
-        // // PROOF GENERATION SECTION START
-        // //Generate the proof for the given program and input
-        // let (hash_pk, hash_vk) = client.setup(HASH_ELF);
-
-        // // Note that we use the "compressed" proof type, which is necessary for aggregation in SP1
-        // let mut hash_proof = client.prove(&hash_pk, hash_stdin).compressed().run().expect("proving failed");
-        // println!("Generated hash_proof");
-
-        // // Verify proof and public values
-        // client.verify(&hash_proof, &hash_vk).expect("verification failed");
-
-        // // Save the proof to file
-        // hash_proof.save("/client/output/hash_proof-with-pis.bin").expect("saving proof failed");
-
-        // // Create a VerificationInputs struct for the hash_proof
-        // let input_1 = VerificationInput {
-        //     proof: hash_proof,
-        //     vk: hash_vk.clone(),
-        // };
-        // // PROOF GENERATION SECTION END
-
-        // Hash the concatenated queries (to be used as random_modifier)
-        let hashed_concat_quries = Scalar::hash_from_bytes::<Sha3_512>(&concat_queries);
-
-        // write needed values to the input stream of checksum proof
-        checksum_stdin.write(&hashed_concat_quries.as_bytes());
-        checksum_stdin.write(&active_security_key);
-        checksum_stdin.write(&sum.compress().as_bytes());
-
-        // Added a parameter in randomized_target to accept a precomuted random_modifier
-        let randomized_target = active_security_key.randomized_target(hashed_concat_quries);
 
         let checksum = randomized_target.get_checksum_point_for_validation(&sum);
         let verification_factor_0 = Scalar::from(rng.gen_range(0u32..=verification_factor_max));
         let x_0 = checksum * verification_factor_0.invert();
-        let local_checksum_state = QueryState::from_rp(x_0, required_keyholders, verification_factor_0);
+        let checksum_state = QueryState::from_rp(x_0, required_keyholders, verification_factor_0);
 
-        // write the remaining values to the input stream
-        checksum_stdin.write(&verification_factor_0.as_bytes());
-        checksum_stdin.write(&local_checksum_state.blinding_factor.as_bytes());
-
-        // DEBUGGING SECTION START
-        // Execute the checksum_proof program using the `ProverClient.execute` method,
-        let (mut checksum_public_values, execution_report) = client.execute(CHECKSUM_ELF, checksum_stdin.clone()).run().unwrap();
-        println!(
-            "Checksum program executed with {} cycles",
-            execution_report.total_instruction_count() + execution_report.total_syscall_count()
-        );
-
-        // Read the checksum_query that is generated in the program
-        let proof_checksum_query = checksum_public_values.read::<Query>();
-
-        // Confirm this output maches the query generated locally
-        if local_checksum_state.query.clone() == proof_checksum_query {
-            println!("Checksum proof: Checksums match.");
-        } else {
-            println!("Checksum proof: Checksums do not match.");
-        }
-
-        // Read in previously generated proof to avoid unecessary computation
-        let (checksum_pk, checksum_vk) = client.setup(CHECKSUM_ELF);
-        let deserialized_checksum_proof =
-            SP1ProofWithPublicValues::load("/client/output/checksum-proof-with-pis.bin").expect("loading proof failed");
-        let input_2 = VerificationInput {
-            proof: deserialized_checksum_proof,
-            vk: checksum_vk.clone(),
+        let witness = QueryWitness {
+            windows,
+            blinding_factors: querystates
+                .iter()
+                .map(|(_, qs)| qs.blinding_factor.to_bytes())
+                .collect(),
+            sum: sum.compress().to_bytes(),
+            random_modifier: randomized_target.random_modifier.to_bytes(),
+            checksum_verification_factor: verification_factor_0.to_bytes(),
+            checksum_blinding_factor: checksum_state.blinding_factor.to_bytes(),
         };
-        // DEBUGGING SECTION END
 
-        // Note: required secureDNA line, after check to not be consumed, DO NOT ALTER
-        querystates.push((None, local_checksum_state));
+        querystates.push((None, checksum_state));
 
-        // // PROOF GENERATION SECTION START
-        // // Generate the proof for the given program and input
-        // let (checksum_pk, checksum_vk) = client.setup(CHECKSUM_ELF);
-        // let mut checksum_proof = client.prove(&checksum_pk, checksum_stdin).compressed().run().expect("proving failed");
-        // println!("Generated checksum_proof");
-
-        // // Verify proof and public values
-        // client.verify(&checksum_proof, &checksum_vk).expect("verification failed");
-
-        // // Save the proof to file
-        // checksum_proof.save("/client/output/checksum-proof-with-pis.bin").expect("saving proof failed");
-
-        // // Create a VerificationInputs struct for the checksum_proof
-        // let input_2 = VerificationInput {
-        //     proof: checksum_proof,
-        //     vk: checksum_vk.clone(),
-        // };
-        // // PROOF GENERATION SECTION END
-
-        // Create the a vector of VerificationInputs
-        let inputs = vec![input_1, input_2];
-
-        (Self {
-            querystates,
-            randomized_target,
-        }, 
-        inputs)
+        (
+            Self {
+                querystates,
+                randomized_target,
+            },
+            witness,
+        )
     }
 
     pub fn len(&self) -> usize {
@@ -568,7 +437,6 @@ impl QueryStateSet {
     }
 
     /// Creates a new serializable version of this set.
-    //JUMP
     pub fn to_serializable_set(&self) -> SerializableQueryStateSet {
         SerializableQueryStateSet {
             querystates: self.querystates

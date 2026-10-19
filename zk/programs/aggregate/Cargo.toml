@@ -1,0 +1,15 @@
+[package]
+name = "zksecuredna-aggregate"
+version = "0.2.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sp1-zkvm = { workspace = true, features = ["verify"] }
+curve25519-dalek = { workspace = true }
+zk_types = { workspace = true }
+doprf = { workspace = true }
+packed_ristretto = { workspace = true }
+sha2 = { workspace = true }
+bincode = { workspace = true }
+serde = { version = "1.0", default-features = false }

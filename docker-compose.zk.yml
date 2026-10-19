@@ -1,0 +1,21 @@
+# zkSecureDNA override: run locally built synthclient/hdbserver (with proof
+# generation and verification) inside the upstream images.
+#
+#   cargo build --release -p synthclient -p hdbserver
+#   docker compose -f docker-compose.yml -f docker-compose.zk.yml up
+#
+# ZK_PROOF_MODE: off | execute | prove (see docs/ZK-DESIGN.md).
+services:
+  client:
+    volumes:
+      - "./target/release/synthclient:/usr/local/bin/synthclient-zk"
+    command: ["/usr/local/bin/synthclient-zk"]
+    environment:
+      ZK_PROOF_MODE: "${ZK_PROOF_MODE:-execute}"
+      SP1_PROVER: "${SP1_PROVER:-cpu}"
+  hdbserver:
+    volumes:
+      - "./target/release/hdbserver:/usr/local/bin/hdbserver-zk"
+    entrypoint: ["/usr/local/bin/hdbserver-zk"]
+    environment:
+      SECUREDNA_HDBSERVER_ZK_VERIFY: "true"

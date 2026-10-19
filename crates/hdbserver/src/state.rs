@@ -36,6 +36,13 @@ pub struct HdbServerState {
     pub exemptions_roots: Vec<PublicKey>,
     pub persistence_path: PathBuf,
     pub persistence_connection: Connection,
+    /// zkSecureDNA proof verification; `None` unless `--zk-verify` is set.
+    pub zk: Option<Arc<ZkState>>,
+}
+
+pub struct ZkState {
+    pub verifier: zk_prover::ScreeningVerifier,
+    pub trusted_active_security_key: zk_prover::zk_types::Digest32,
 }
 
 impl HdbServerState {

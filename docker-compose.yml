@@ -1,3 +1,5 @@
+version: '3'
+
 # SecureDNA env vars are picked up through `.env` in the repo root.
 
 x-environment: &keyserver-common-env
@@ -8,20 +10,17 @@ services:
   client:
     image: ghcr.io/securedna/client:${SECUREDNA_TAG}
     ports:
-      - "8080:80"
+      - "80:80"
     depends_on:
       - keyserver1
       - keyserver2
       - keyserver3
-    working_dir: /client
     command: [
       "./synthclient",
     ]
     volumes:
       - "${TEST_CERTS_PATH:-./test/certs}:/certs/"
       - "${TEST_CFG_PATH:-./test/cfg}:/cfg/"
-      - "./target/release/synthclient:/client/synthclient"
-      - "./client_output:/client/output"
     environment:
       "SECUREDNA_CFG_PATH": "/cfg/synthesizer.toml"
   hdbserver:
@@ -32,8 +31,6 @@ services:
       - "${TEST_HDB_PATH:-./data/hdb}:/data/hdb"
       - "${TEST_CERTS_PATH:-./test/certs}:/certs/"
       - "${TEST_CFG_PATH:-./test/cfg}:/cfg/"
-      - "./target/release/hdbserver:/usr/local/bin/hdbserver"   
-    entrypoint: ["/usr/local/bin/hdbserver"]  # Add this line  
     environment:
       "SECUREDNA_CFG_PATH": "/cfg/database.toml"
   keyserver1:

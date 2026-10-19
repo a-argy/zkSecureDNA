@@ -1,0 +1,27 @@
+[package]
+name = "zk_cli"
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+edition = "2021"
+
+[[bin]]
+name = "zksecuredna"
+path = "src/main.rs"
+
+[features]
+cuda = ["zk_prover/cuda"]
+
+[dependencies]
+anyhow = "1.0.75"
+clap = { version = "4.5.0", features = ["derive"] }
+curve25519-dalek = { workspace = true }
+hex = "0.4"
+rand = "0.8.5"
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+zk_escrow = { path = "../zk_escrow" }
+zk_prover = { path = "../zk_prover" }
+zk_types = { path = "../zk_types" }

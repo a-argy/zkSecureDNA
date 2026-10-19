@@ -130,7 +130,7 @@ async fn reconfigure(
         yubico_api_secret_key: app_cfg.yubico_api_secret_key,
     };
 
-    let persistence_connection = if let Some(prev_state) = prev_state {
+    let persistence_connection = if let Some(prev_state) = &prev_state {
         if app_cfg.event_store_path != prev_state.persistence_path {
             return Err(anyhow::anyhow!(
                 "Changes to event_store_path not supported: expected {:?}, but found {:?}",
@@ -144,6 +144,29 @@ async fn reconfigure(
         crate::event_store::open_db(&app_cfg.event_store_path)
             .await
             .context("opening event_store db")?
+    };
+
+    let zk = if !app_cfg.zk_verify {
+        None
+    } else if let Some(zk) = prev_state.as_ref().and_then(|s| s.zk.clone()) {
+        // Verifier setup derives verifying keys from the circuits; reuse on reload.
+        Some(zk)
+    } else {
+        // Without a pinned key, a lab could run its own keyservers.
+        let digest = app_cfg.zk_active_security_key_digest.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--zk-verify requires --zk-active-security-key-digest")
+        })?;
+        let bytes = hex::decode(digest).context("zk active security key digest is not hex")?;
+        let trusted_active_security_key: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("zk active security key digest must be 32 bytes"))?;
+        let verifier = zk_prover::ScreeningVerifier::new()
+            .await
+            .context("setting up zk verifier")?;
+        Some(Arc::new(crate::state::ZkState {
+            verifier,
+            trusted_active_security_key,
+        }))
     };
 
     Ok(Arc::new(HdbServerState {
@@ -169,6 +192,7 @@ async fn reconfigure(
         exemptions_roots,
         persistence_path: app_cfg.event_store_path,
         persistence_connection,
+        zk,
     }))
 }
 
@@ -511,6 +535,8 @@ mod test {
             keypair_passphrase_file: "test/certs/database-token.passphrase".into(),
             allow_insecure_cookie: true,
             event_store_path: Config::default_event_store_path(),
+            zk_verify: false,
+            zk_active_security_key_digest: None,
         };
         let server_config = ServerConfig {
             main: PlaneConfig {

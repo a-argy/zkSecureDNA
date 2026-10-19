@@ -4,197 +4,166 @@
 
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-informational?style=flat-square)](COPYRIGHT.md)
 
-**Making biosecurity screening auditable.** zkSecureDNA extends the [SecureDNA](https://securedna.org) DNA synthesis screening protocol with zero-knowledge proofs, so a synthesis lab can prove to a third party that it correctly screened an order against the hazard database — without revealing the DNA sequence it screened, and without the verifier needing to trust the lab or the keyservers.
+**Verifiable DNA synthesis screening.** zkSecureDNA extends the
+[SecureDNA](https://securedna.org) screening protocol with zero-knowledge
+proofs. A synthesis lab gets a compact, publicly checkable record showing it
+screened an order with a registered screening service, following the
+protocol, without revealing anything about the order. Records go to an
+on-chain registry where any field can be opened only by a threshold of
+authorities, and every opening is publicly announced.
 
-Three [SP1](https://github.com/succinctlabs/sp1) zkVM circuits over SecureDNA's real distributed-OPRF cryptography, composed by a recursive aggregation circuit, with a verification endpoint added to the hazard database server.
+Forked from [`SecureDNA/SecureDNA`](https://github.com/SecureDNA/SecureDNA).
+Project concept by Neil Perry. Built on [SP1](https://github.com/succinctlabs/sp1) 6.9.
 
-> **Status: research prototype.** The circuits are implemented and validated against the native implementation; end-to-end proof *generation* is currently disabled in favor of zkVM execute-mode. See [Current state](#current-state) for exactly what runs today and what doesn't. Forked from [`SecureDNA/SecureDNA`](https://github.com/SecureDNA/SecureDNA).
+- **Design and security argument:** [docs/ZK-DESIGN.md](docs/ZK-DESIGN.md)
+- **Write-up:** [docs/WRITEUP.md](docs/WRITEUP.md)
 
----
+> Research prototype. Not audited. The authority committee uses a trusted
+> dealer, and the registry has not been deployed to a public network.
 
-## The problem
+## Why this matters
 
-DNA synthesis is cheap and getting cheaper. That's mostly good, and occasionally catastrophic: the same technology that accelerates vaccine development also lowers the barrier to synthesizing a known pathogen. Screening synthesis orders against a hazard database is the obvious control, and it runs into an obvious problem — **the hazard database is itself a blueprint**. You cannot hand every synthesis lab a list of dangerous sequences.
+SecureDNA keeps both the customer's order and the hazard database secret,
+but it produces no evidence: after screening, only the lab knows it
+screened. A regulator, insurer or the public must either trust the lab or
+audit it in a way that exposes orders or the database. zkSecureDNA gives
+the lab a record anyone can verify, showing it screened the real order with
+the real, registered service, while revealing nothing about the order.
 
-SecureDNA solves this with cryptography. Its screening protocol satisfies three constraints simultaneously:
+This is one instance of a general pattern that matters for AI governance as
+well: *proving a safety check was performed, on the real input, by the real
+checker, without handing over the sensitive data involved*. A developer
+might need to show that a required evaluation ran on the deployed model, by
+an approved evaluator, without revealing weights. The recipe is the same:
+commit to the private input, prove each step against keys the verifier
+pins, have the external checker sign what it saw, and bind it all into one
+artifact that authorities can open only jointly and publicly.
 
-1. **Screen orders** against known hazardous sequences.
-2. **Never disclose the hazard database**, even to participating labs.
-3. **Never disclose the customer's order** to the screening infrastructure.
+What is still trusted: the screening service's database (the proofs show
+the protocol was followed, not that the database is complete), the
+committee setup (trusted dealer for now), and the permanence of encrypted
+records on a public chain. The full argument, including lessons from v1, is
+in the [write-up](docs/WRITEUP.md).
 
-It works through a **Distributed Oblivious Pseudo-Random Function (DOPRF)**. DNA is cut into short windows (~42 bp). The client blinds each window and sends it to a set of keyservers holding Shamir shares of a PRF key; a threshold `t` of `n` must cooperate, and no single keyserver can evaluate the PRF alone or learn the query. The client unblinds the combined result into a hash and checks it against an encrypted database. Randomized checksums let the client detect — and identify — a keyserver that computed its share incorrectly.
+## What it proves
 
-The protocol was developed by researchers at MIT, Aarhus, Shanghai Jiao Tong, Tsinghua, and Northeastern.
-
-## The gap zkSecureDNA fills
-
-SecureDNA's guarantees are strong but **local to the participants**. The client knows it screened correctly. A regulator, an insurer, or the public has no way to check that a given order was screened at all. The protocol produces conviction, not evidence.
-
-That gap matters because screening compliance is exactly the thing you'd want auditable. Today the only options are trusting the lab's word or auditing it in a way that exposes either the orders or the hazard database.
-
-zkSecureDNA wraps the protocol's critical computations in zkVM proofs. The resulting artifact is a compact, publicly checkable object attesting that the screening protocol was executed correctly on some order — while revealing nothing about the DNA sequence. It's the difference between "we screen everything, trust us" and a verifiable record.
-
----
-
-## Architecture
-
-Three circuits, mirroring the three cryptographic steps a client performs. Each is a standalone SP1 program compiled to RISC-V.
-
-### 1. Hash proof — [`hash_proof/`](hash_proof/)
-
-Proves the client correctly derived its blinded queries from real DNA windows. Reads window bytes and blinding factors in a loop (terminated by an empty-vector sentinel), hashes each window to a Ristretto point, applies the blinding factor, and commits the resulting `Query`.
-
-```rust
-// hash_proof/program/src/main.rs
-let hashed_point = RistrettoPoint::hash_from_bytes::<Sha3_512>(&bytes);
-let blinding_factor = Scalar::from_canonical_bytes(blinding_bytes).unwrap();
-let query = Query::from_rp(hashed_point * blinding_factor);
-sp1_zkvm::io::commit::<Query>(&query);
+```
+windows ─► hash proof ─────┐
+            checksum proof ┼─► aggregation proof ─► HDB verifies, screens, signs
+keyservers ─► DLEQ proofs ─┘                                │
+                                                            ▼
+                     record proof (Groth16) ─► ZkSecureDNARegistry (on chain)
 ```
 
-This binds the public queries to an actual hash-to-curve of real input, closing the hole where a lab submits arbitrary group elements it knows the preimages of.
-
-### 2. Checksum proof — [`checksum_proof/`](checksum_proof/)
-
-Proves the active-security checksum. Reconstructs the `RandomizedTarget` from the active security key, derives the checksum point for the batch, inverts out the verification factor, and re-blinds:
-
-```rust
-// checksum_proof/program/src/main.rs
-let randomized_target = active_security_key.randomized_target(hashed_concat_quries);
-let checksum = randomized_target.get_checksum_point_for_validation(&sum);
-let x_0 = checksum * verification_factor_0.invert();
-sp1_zkvm::io::commit::<Query>(&Query::from_rp(x_0 * blinding_factor));
-```
-
-This is the step that catches a cheating keyserver, so proving it is what lets a verifier conclude the keyserver responses were actually validated rather than accepted.
-
-### 3. Verification proof — [`verification_proof/`](verification_proof/)
-
-The aggregation circuit. It **recursively verifies the other two proofs inside the zkVM**, then finishes the protocol in the same execution:
-
-```rust
-// verification_proof/program/src/main.rs
-for i in 0..vkeys.len() {
-    sp1_zkvm::lib::verify::verify_sp1_proof(&vkeys[i], &Sha256::digest(&public_values[i]).into());
-}
-// ... then incorporate keyserver responses and complete the DOPRF
-let hash_values = querystate.get_hash_values()?;   // triggers checksum validation
-sp1_zkvm::io::commit::<PackedRistrettos<TaggedHash>>(&packed_hashes);
-```
-
-The two sub-proof verifying keys come from `client.setup()` on the hash and checksum ELFs and are supplied as witnesses ([`crates/doprf/src/prf.rs:474`](crates/doprf/src/prf.rs)).
-
-Recursion is what makes this practical. Without it, a verifier would need all three proofs plus the logic to relate them. With it, **one proof attests to the entire screening pipeline**, and its size doesn't grow with the number of steps folded in.
-
-### Verification endpoint
-
-The hazard database server gained a `/scep/screen-and-verify` endpoint ([`crates/hdbserver/src/screening.rs:81`](crates/hdbserver/src/screening.rs)) that accepts the proof and verifying key alongside the Ristretto query data, verifies the proof, and only then runs the normal screening path. This moves the check to the party that actually cares — the HDB will not answer a query it can't verify was legitimately derived.
-
-### Accumulator groundwork — [`crates/hdb_acc/`](crates/hdb_acc/)
-
-Walks the HDB shard files and converts the 32-byte hash prefixes into BLS12-381 scalar field elements, as preparation for a [`vb_accumulator`](https://crates.io/crates/vb_accumulator)-based membership scheme. **This is unfinished** — the conversion and its tests work, but no accumulator is constructed and nothing references the crate yet. It's the direction the work was headed, not a completed component.
-
----
-
-## Changes to upstream SecureDNA
-
-| Crate | Change |
+| Component | Proves |
 |---|---|
-| [`doprf/`](crates/doprf/) | New `sp1` feature. Added `SerializableQueryStateSet` and `VerificationInput`; rewrote `QueryStateSet::from_iter` to drive the hash and checksum circuits and return their verification inputs alongside the query state. |
-| [`doprf/src/active_security.rs`](crates/doprf/src/active_security.rs) | Added `SerializableRandomizedTarget` and `get_checksum_point_for_validation()` — the checksum computation had to be reachable in isolation to be provable. |
-| [`doprf_client/`](crates/doprf_client/) | `hash()` now returns a `VerificationInput` with the query data; added the recursive verification-proof driver. |
-| [`hdbserver/`](crates/hdbserver/) | New `scep_endpoint_screen_and_verify` that verifies a proof before screening. |
-| [`scep/`](crates/scep/), [`scep_client_helpers/`](crates/scep_client_helpers/) | New `SCREEN_AND_VERIFY_ENDPOINT` and the client-side `screen_and_verify()` call. |
-| Root `Cargo.toml` | `[patch.crates-io]` redirecting `sha3` and `curve25519-dalek` to SP1 precompile forks. |
+| `zk/programs/hash` | Blinded queries were derived from the committed windows. |
+| `zk/programs/checksum` | The active-security checksum was built from the published key and a fresh secret modifier. |
+| `zk/programs/aggregate` | Both sub-proofs verify and match the query state. Each keyserver's batched Chaum–Pedersen proof verifies against its key interpolated from the active-security commitments. The responses pass active security. The final hashes are correct. |
+| HDB `/scep/screen-and-verify` | Verifies with its own pinned keys, requires the proof to be about the exact request and the pinned keyservers, screens, and signs an attestation. |
+| `zk/programs/record` | Verifies the aggregation proof and the HDB's Ed25519 attestation, opens the order commitment, and encrypts every record field to the authority committee (threshold hashed-ElGamal, `crates/zk_escrow`). |
+| `contracts/src/ZkSecureDNARegistry.sol` | Verifies the record proof. Pins each screener's HDB key, keyservers and circuits. Rejects replays, stale records and mismatched ciphertexts. Runs threshold-approved investigations with public notice, and threshold governance. |
 
-That last row is small and load-bearing. SHA3-512 and Ristretto scalar multiplication dominate the circuits' cycle counts; routing them through SP1's accelerated precompiles rather than executing the pure-Rust implementations inside the zkVM is the difference between a tractable circuit and an intractable one.
+## Results
 
-A serialization theme runs through all of this. Cryptographic state that lived comfortably as in-memory Rust structs had to cross the host/guest boundary, which meant giving `QueryStateSet`, `RandomizedTarget`, and `RequestContext` explicit serializable forms. Most of the integration work was this, not the circuit logic.
+Synthetic orders, keyservers simulated in process with real keyshares,
+compressed proofs, SP1 6.9 (`crates/zk_prover/examples/bench.rs`):
 
----
+| Order (windows) | CPU: 32 vCPU (n2) | GPU: 1× NVIDIA L4 | Proof | HDB verify |
+|---|---|---|---|---|
+| 1 | 377 s | 16.4 s | 1.27 MB | 47–60 ms |
+| 10 | 491 s | 25.0 s | 1.27 MB | 47–60 ms |
+| 100 | 1,774 s | 110 s | 1.27 MB | 47–60 ms |
+| 500 | — | 446 s | 1.27 MB | 60 ms |
 
-## Current state
+On-chain record: the record circuit (1.78M cycles) wrapped in Groth16 gives a
+356-byte proof; `submitRecord` with SP1's v6.1.0 verifier costs 674,609 gas
+for a 3-field record.
 
-Being precise about what runs, since "has ZK proofs" can mean several things:
+The full SecureDNA integration test (real keyservers and HDB in process, six
+screenings, every proof verified by the HDB) passes in 5.4 minutes on the
+L4. The same test with the pre-keyserver-proof circuits took 51 minutes on a
+32-core CPU.
 
-**Working:**
-- All three circuits compile and execute correctly in the SP1 zkVM.
-- Circuit outputs are validated against the native implementation on every run — the host recomputes each result and asserts equality (`"Hash proof: Hashes match."`, `"Checksum proof: Checksums match."`, `"Verification Proof: Incorporated responses match."`).
-- Recursive aggregation of the two sub-proofs was demonstrated working (commit `f6bafd6`).
-- The HDB verification endpoint verifies a supplied proof and gates screening on it.
+Tests:
 
-**Not working / not built:**
-- **Proof generation is commented out** throughout ([`crates/doprf/src/prf.rs:337`](crates/doprf/src/prf.rs), [`crates/doprf_client/src/doprf_client.rs:346`](crates/doprf_client/src/doprf_client.rs)). The code paths run `client.execute()` and load previously generated proofs from disk. Restoring `client.prove()` is a matter of uncommenting the adjacent blocks; it was disabled because proving on every iteration made the development loop impractical, and EVM-compatible wrapping needs ≥128 GB RAM.
-- **There is no on-chain verifier.** The `contracts/` directories are unmodified SP1 project templates (`Fibonacci.sol`) and verify nothing about DNA screening. On-chain verification is a plausible extension, not something this repo implements. *(An earlier version of this README described a `SecureDNAVerifier` contract; no such contract exists here, and the claim has been removed.)*
-- **No performance numbers were recorded.** Cycle-count instrumentation is in place but no output was captured, so this README quotes no proving times, cycle counts, or proof sizes.
-- The accumulator crate is groundwork only (above).
-- SP1 template residue remains in places — the guest packages are still named `fibonacci-program`.
+- `cargo test -p zk_prover --test binding`: tampered query state,
+  substituted modifier, cheating keyserver, impostor keyserver, self-run
+  keyservers. Each must be rejected.
+- `cargo test -p doprf dleq` and `cargo test -p zk_escrow`.
+- `forge test` in `contracts/`: registry rules, plus a real Groth16 record
+  verified by SP1's on-chain verifier.
+- `crates/zk_prover/examples/record_fixture.rs`: end to end from screening to
+  record, including a 2-of-3 field opening.
 
----
+Upstream unit tests for every modified crate pass. The exception is
+`certificates/tests/check_test_certs.rs`: its 8 failures also occur on
+unmodified upstream, because the bundled test certificates no longer
+validate as of October 2026.
 
-## Getting started
+## Running
 
-**Prerequisites:** [Rust](https://rustup.rs/) (see `rust-toolchain.toml`), [SP1](https://docs.succinct.xyz/getting-started/install.html), and optionally [Foundry](https://getfoundry.sh/).
+Prerequisites: Rust (see `rust-toolchain.toml`), [SP1](https://docs.succinct.xyz)
+(`sp1up`), and [Foundry](https://getfoundry.sh) for the contracts. GPU
+proving needs an NVIDIA GPU with compute capability ≥ 8.0, plus the `cuda`
+feature.
 
 ```sh
-# Build a circuit
-cd hash_proof/program && cargo prove build
+# Proofs on/off for the screening client: off | execute | prove
+export ZK_PROOF_MODE=prove SP1_PROVER=cpu   # or cuda (with --features zk_prover/cuda)
 
-# Execute without proving (fast; validates circuit output against native)
-cd ../script && cargo run --release -- --execute
+# End-to-end test with real keyservers + HDB (HDB verifies every proof)
+cargo test --release -p doprf_client --features zk --test test_integration
 
-# Generate a core proof
-cargo run --release -- --prove
+# Benchmarks and record fixture
+cargo run --release -p zk_prover --example bench -- 1 10 100
+cargo run --release -p zk_prover --example record_fixture
+
+# Contracts
+cd contracts && forge install foundry-rs/forge-std succinctlabs/sp1-contracts@v6.1.1 && forge test
 ```
 
-> EVM-compatible Groth16 proofs require ≥128 GB RAM. Use the [Succinct Prover Network](https://docs.succinct.xyz/generating-proofs/prover-network.html) instead.
-
-Run the full SecureDNA system per upstream instructions:
+Full SecureDNA stack with proofs (locally built binaries in the upstream
+images; this compose path has not been exercised end to end, the
+integration test above covers the same flow in process):
 
 ```sh
-earthly +dev && docker compose up     # or: ./bin/local_test_environment.sh
+cargo build --release -p synthclient -p hdbserver
+docker compose -f docker-compose.yml -f docker-compose.zk.yml up
 ```
 
-Once `synthclient` is up:
+The HDB needs `SECUREDNA_HDBSERVER_ZK_VERIFY=true` and
+`SECUREDNA_HDBSERVER_ZK_ACTIVE_SECURITY_KEY_DIGEST=<hex>`. The synthclient
+writes receipts to `ZK_RECEIPT_DIR`.
 
-```bash
-echo -e ">Influenza_segment_1\nggcacatctggggtggagtctgctgtcctgagaggatttctcattttcgacaaagaagacaagagatatgacctagcattaagcatcaatgaactgagcaatcttgcaaaaggagagaaggctaatgtgctaattgggcaaggggacgtagtgttggtaatgaaacgaaaacgggactctagcatacttactgacagccagacagcgaccaaaagaattcggatggccatcaattag\n" \
-  | jq -sR '{fasta: ., region: "all"}' | curl localhost/v1/screen -d@-
+Records and investigations (`crates/zk_cli`):
+
+```sh
+zksecuredna committee-deal --threshold 3 --members 5 --out committee/   # dev only
+zksecuredna record --receipt r.json --committee-key 0x… \
+  --field purpose=… --field lab_id=… --field printer_id=… --field location=… --field timestamp=… \
+  --out submission.json                                                # → submitRecord
+zksecuredna recipient-keygen --out recipient.json
+zksecuredna share --share committee/share-2.json --record-id 0x… --field 1 \
+  --encrypted-field 0x… --recipient 0x…                                # → submitDecryptionShare
+zksecuredna open --recipient-key recipient.json --committee committee/committee.json \
+  --record-id 0x… --field 1 --encrypted-field 0x… --sealed 0x… --sealed 0x… --sealed 0x…
 ```
 
----
+## What changed from upstream SecureDNA
 
-## Repository structure
+| Area | Change |
+|---|---|
+| `crates/doprf` | `QueryStateSet::from_iter_with_witness`; `dleq` module; keyserver public keys from the active-security key; the randomized target is recomputed, never deserialized. No SP1 dependency. |
+| `crates/keyserver` | `/scep/keyserve-proved`: responses plus a batched DLEQ proof. |
+| `crates/doprf_client` | `zk` feature: proves while keyservers work, attaches proofs to screening (exemption-token path included), verifies the HDB attestation, returns a receipt. |
+| `crates/hdbserver` | `--zk-verify` / `--zk-active-security-key-digest`; `/scep/screen-and-verify` verifies, screens via the unmodified path, and signs. |
+| New crates | `zk_types` (statements, digests, wire formats), `zk_prover` (prover/verifier, benchmarks), `zk_escrow` (threshold field encryption), `zk_cli`. |
+| New | `zk/programs/*` (four SP1 circuits), `contracts/` (registry, tests, deploy script). |
 
-Added by this fork:
-
-```
-hash_proof/           SP1 circuit — query hashing and blinding
-checksum_proof/       SP1 circuit — active-security checksum validation
-verification_proof/   SP1 circuit — recursive aggregation + protocol completion
-crates/hdb_acc/       BLS12-381 scalar conversion for HDB hashes (groundwork)
-```
-
-Upstream SecureDNA:
-
-```
-crates/
-├── doprf/               distributed oblivious PRF  (modified: sp1 feature)
-├── doprf_client/        keyserver client            (modified: proof driver)
-├── hdb/, hdbserver/     hash database + server      (modified: verify endpoint)
-├── keyserver/           DOPRF keyserver
-├── synthclient/         client-side screening service
-├── certificates/, certificate_client/
-└── awesome_hazard_analyzer/
-frontend/                React/TypeScript web interfaces
-test/                    test data (`ln -s test/data data` for a small test HDB)
-```
-
-## References
-
-- [SecureDNA: Cryptographic Aspects of DNA Screening](https://securedna.org) — Baum, Cui, Damgård, Esvelt, Gao, Gretton, Paneth, Rivest, Vaikuntanathan, Wichs, Yao, Yu
-- [SP1 zkVM](https://github.com/succinctlabs/sp1) — Succinct Labs
-- [Original SecureDNA repository](https://github.com/SecureDNA/SecureDNA)
+v1 of this fork (SP1 3.0, 2024–25) is in the git history. Its circuits were
+not bound to each other or to the request; see the "Lessons from v1" section
+of the write-up.
 
 ## License
 

@@ -198,6 +198,14 @@ pub struct PublicKey([u8; Self::LEN]);
 impl PublicKey {
     const LEN: usize = 32;
 
+    pub fn to_bytes(&self) -> [u8; Self::LEN] {
+        self.0
+    }
+
+    pub fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
+        Self(bytes)
+    }
+
     pub fn verify(
         &self,
         message: &[u8],
@@ -259,6 +267,14 @@ pub struct Signature([u8; Self::LEN]);
 
 impl Signature {
     const LEN: usize = 64;
+
+    pub fn to_bytes(&self) -> [u8; Self::LEN] {
+        self.0
+    }
+
+    pub fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
+        Self(bytes)
+    }
 }
 
 asn_encode_as_octet_string_impl!(Signature, Signature::LEN);

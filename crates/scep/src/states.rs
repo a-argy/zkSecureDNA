@@ -54,6 +54,11 @@ impl<State> ServerSessions<State> {
     pub fn take_session(&mut self, cookie: &SessionCookie) -> Option<State> {
         self.0.remove(cookie)
     }
+
+    /// Whether a session exists, without taking it.
+    pub fn has_session(&self, cookie: &SessionCookie) -> bool {
+        self.0.contains_key(cookie)
+    }
 }
 
 impl<T> Default for ServerSessions<T> {

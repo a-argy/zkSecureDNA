@@ -31,6 +31,7 @@ certificates = { path = "../certificates" }
 doprf = { path = "../doprf" }
 zk_prover = { path = "../zk_prover" }
 hdb = { path = "../hdb" }
+hdb_trie = { path = "../hdb_trie" }
 minhttp = { path = "../minhttp" }
 persistence = { path = "../persistence" }
 scep = { path = "../scep" }

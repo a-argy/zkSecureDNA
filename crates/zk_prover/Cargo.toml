@@ -32,6 +32,7 @@ sp1-build = "6.9.0"
 
 [dev-dependencies]
 alloy-sol-types = "1.0"
+hdb_trie = { path = "../hdb_trie" }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hex = "0.4"
 serde_json = "1"

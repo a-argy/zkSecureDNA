@@ -52,9 +52,12 @@ commit to the private input, prove each step against keys the verifier
 pins, have the external checker sign what it saw, and bind it all into one
 artifact that authorities can open only jointly and publicly.
 
-What is still trusted: the screening service's database (the proofs show
-the protocol was followed, not that the database catches every hazardous
-sequence; improving detection is separate work that this complements), the
+What is still trusted: the contents of the screening service's database
+(lookups are proven against a published root, so the service cannot
+misreport what the database holds, but nothing shows it catches every
+hazardous sequence; improving detection is separate work that this
+complements), what the service does with a hit (exemptions, regional
+rules), the
 committee setup (trusted dealer for now), and the permanence of encrypted
 records on a public chain. The full argument, including lessons from v1, is
 in the [write-up](docs/WRITEUP.md).
@@ -74,9 +77,9 @@ keyservers ─► DLEQ proofs ─┘                                │
 | `zk/programs/hash` | Blinded queries were derived from the committed windows. |
 | `zk/programs/checksum` | The active-security checksum was built from the published key and a fresh secret modifier. |
 | `zk/programs/aggregate` | Both sub-proofs verify and match the query state. Each keyserver's batched Chaum–Pedersen proof verifies against its key interpolated from the active-security commitments. The responses pass active security. The final hashes are correct. |
-| HDB `/scep/screen-and-verify` | Verifies with its own pinned keys, requires the proof to be about the exact request and the pinned keyservers, screens, and signs an attestation. |
-| `zk/programs/record` | Verifies the aggregation proof and the HDB's Ed25519 attestation, opens the order commitment, and encrypts every record field to the authority committee (threshold hashed-ElGamal, `crates/zk_escrow`). |
-| `contracts/src/ZkSecureDNARegistry.sol` | Verifies the record proof. Pins each screener's HDB key, keyservers and circuits. Rejects replays, stale records and mismatched ciphertexts. Runs threshold-approved investigations with public notice, and threshold governance. |
+| HDB `/scep/screen-and-verify` | Verifies with its own pinned keys, requires the proof to be about the exact request and the pinned keyservers, screens, returns a Merkle-trie lookup proof for every hash, and signs an attestation naming the database root. |
+| `zk/programs/record` | Verifies the aggregation proof, the HDB's Ed25519 attestation, and every lookup proof against the attested database root (so the number of database hits is proven, not reported), opens the order commitment, and encrypts every record field to the authority committee (threshold hashed-ElGamal, `crates/zk_escrow`). |
+| `contracts/src/ZkSecureDNARegistry.sol` | Verifies the record proof. Pins each screener's HDB key, keyservers, circuits and curator-published database roots. Rejects replays, stale records and mismatched ciphertexts. Runs threshold-approved investigations with public notice, and threshold governance. |
 
 ## Results
 
@@ -90,12 +93,31 @@ compressed proofs, SP1 6.9 (`crates/zk_prover/examples/bench.rs`):
 | 100 | 1,774 s | 110 s | 1.27 MB | 47–60 ms |
 | 500 | — | 446 s | 1.27 MB | 60 ms |
 
-On-chain record: the record circuit (1.78M cycles) wrapped in Groth16 gives a
-356-byte proof; `submitRecord` with SP1's v6.1.0 verifier costs 674,609 gas
-for a 3-field record.
+On-chain record: the record circuit (1.87M cycles, lookup proofs included)
+wrapped in Groth16 gives a 356-byte proof; `submitRecord` with SP1's v6.1.0
+verifier costs 668,856 gas for a 3-field record.
+
+Database lookup proofs (random synthetic databases, L4; `hdbtrie bench` and
+`crates/zk_prover/examples/lookup_bench.rs`):
+
+| Database entries | Build trie | Mean path | Proof size | Check one proof (native) |
+|---|---|---|---|---|
+| 1M | 0.5 s | 20.6 | 705 B | 16 µs |
+| 10M | 4.7 s | 23.9 | 810 B | 19 µs |
+| 100M | 48 s | 27.2 | 916 B | 22 µs |
+
+| Order (hashes) | Record circuit, no lookups | + lookups, 1M-entry DB | + lookups, 100M-entry DB | Record proof, 100M DB (L4) | Lookup proofs sent |
+|---|---|---|---|---|---|
+| 1 | 1.78M cycles | 1.83M | 1.84M | 5.1 s | 0.9 KB |
+| 10 | 1.83M | 2.36M | 2.51M | 5.7 s | 8.8 KB |
+| 100 | 2.28M | 7.55M | 9.24M | 10.0 s | 89 KB |
+| 500 | 4.30M | 30.6M | 39.1M | 30.4 s | 444 KB |
+
+About 70,000 cycles per lookup, growing with the log of the database size.
 
 The full SecureDNA integration test (real keyservers and HDB in process, six
-screenings, every proof verified by the HDB) passes in 5.4 minutes on the
+screenings, every proof verified by the HDB, every HDB lookup proof verified
+by the client) passes in 5.4 minutes on the
 L4. The same test with the pre-keyserver-proof circuits took 51 minutes on a
 32-core CPU.
 
@@ -105,10 +127,14 @@ Tests:
   substituted modifier, cheating keyserver, impostor keyserver, self-run
   keyservers. Each must be rejected.
 - `cargo test -p doprf dleq` and `cargo test -p zk_escrow`.
+- `cargo test -p hdb_trie`: roots match the definition and ignore insertion
+  order; member and non-member proofs verify; forged proofs (swapped
+  terminal, borrowed leaf, tampered or truncated path, wrong root) fail.
 - `forge test` in `contracts/`: registry rules, plus a real Groth16 record
   verified by SP1's on-chain verifier.
 - `crates/zk_prover/examples/record_fixture.rs`: end to end from screening to
-  record, including a 2-of-3 field opening.
+  record, including a 2-of-3 field opening; the record circuit counts a
+  database hit and rejects lookup proofs against a root the HDB did not attest.
 
 Upstream unit tests for every modified crate pass. The exception is
 `certificates/tests/check_test_certs.rs`: its 8 failures also occur on
@@ -131,7 +157,12 @@ cargo test --release -p doprf_client --features zk --test test_integration
 
 # Benchmarks and record fixture
 cargo run --release -p zk_prover --example bench -- 1 10 100
+cargo run --release -p zk_prover --example lookup_bench -- 1 10 100
 cargo run --release -p zk_prover --example record_fixture
+
+# Database trie: the root a curator publishes, and a size benchmark
+cargo run --release -p hdb_trie --bin hdbtrie -- root --hdb path/to/hdb
+cargo run --release -p hdb_trie --bin hdbtrie -- bench --entries 10000000
 
 # Contracts
 cd contracts && forge install foundry-rs/forge-std succinctlabs/sp1-contracts@v6.1.1 && forge test
@@ -170,9 +201,9 @@ zksecuredna open --recipient-key recipient.json --committee committee/committee.
 |---|---|
 | `crates/doprf` | `QueryStateSet::from_iter_with_witness`; `dleq` module; keyserver public keys from the active-security key; the randomized target is recomputed, never deserialized. No SP1 dependency. |
 | `crates/keyserver` | `/scep/keyserve-proved`: responses plus a batched DLEQ proof. |
-| `crates/doprf_client` | `zk` feature: proves while keyservers work, attaches proofs to screening (exemption-token path included), verifies the HDB attestation, returns a receipt. |
-| `crates/hdbserver` | `--zk-verify` / `--zk-active-security-key-digest`; `/scep/screen-and-verify` verifies, screens via the unmodified path, and signs. |
-| New crates | `zk_types` (statements, digests, wire formats), `zk_prover` (prover/verifier, benchmarks), `zk_escrow` (threshold field encryption), `zk_cli`. |
+| `crates/doprf_client` | `zk` feature: proves while keyservers work, attaches proofs to screening (exemption-token path included), verifies the HDB attestation and every lookup proof, returns a receipt. |
+| `crates/hdbserver` | `--zk-verify` / `--zk-active-security-key-digest`; builds the database trie on load; `/scep/screen-and-verify` verifies, screens via the unmodified path, proves every lookup, and signs. |
+| New crates | `zk_types` (statements, digests, wire formats, trie proof verification), `hdb_trie` (database Merkle trie and lookup proofs), `zk_prover` (prover/verifier, benchmarks), `zk_escrow` (threshold field encryption), `zk_cli`. |
 | New | `zk/programs/*` (four SP1 circuits), `contracts/` (registry, tests, deploy script). |
 
 v1 of this fork (SP1 3.0, 2024–25) is in the git history. Its circuits were

@@ -13,12 +13,14 @@ from the project's original plan.
  checksum      ─► checksum ─┤      queries ──────────► parts + DLEQ proof
                 proof       ├─► aggregation proof ───────────────► verify proof
                             │   (verifies both, checks DLEQs,       screen hashes
-                            │    runs active security)              sign attestation
+                            │    runs active security)              prove lookups (trie)
+                            │                                       sign attestation
                             │                                           │
- receipt = proof + attestation + commitment opening ◄───────────────────┘
+ receipt = proof + attestation + lookup proofs + commitment opening ◄───┘
         │
-        └─► record proof (verifies aggregation proof + attestation, opens the
-            commitment, encrypts fields to the authority committee)
+        └─► record proof (verifies aggregation proof + attestation + every
+            lookup proof, opens the commitment, encrypts fields to the
+            authority committee)
                  │  Groth16
                  ▼
           ZkSecureDNARegistry (on chain)
@@ -87,24 +89,72 @@ means only the real keyservers can produce an acceptable statement.
    to match the request body, and the active-security key to be the pinned one;
 4. screens through the unmodified upstream path (plain and exemption-token
    screenings both end here);
-5. signs `zk_types::HdbAttestation` (statement digest, hashes digest, hazard
-   count, timestamp, its public key) with its Ed25519 SCEP key.
+5. proves, for every hash in the request, what its database holds for it
+   (section 2a);
+6. signs `zk_types::HdbAttestation` (statement digest, hashes digest, hazard
+   count, timestamp, its public key, and the database root the lookups are
+   against) with its Ed25519 SCEP key.
 
-The client checks the attestation signature and that it names its own
-statement, then keeps a `ZkReceipt` (proof, statement, attestation,
-commitment salt, windows), written to `ZK_RECEIPT_DIR` by the synthclient.
+The client checks the attestation signature, that it names its own
+statement, and every lookup proof against the attested root. It then keeps a
+`ZkReceipt` (proof, statement, attestation, commitment salt, windows, the
+exact hashes sent, lookup proofs), written to `ZK_RECEIPT_DIR` by the
+synthclient.
+
+## 2a. Database lookup proofs (Merkle trie)
+
+Without these, "this hash is not in the database" is only the HDB's signed
+word. With them, it is proven against a root the HDB commits to in advance.
+
+**The trie** (`zk_types::trie`, built by `crates/hdb_trie`). The database's
+entries (32-byte hash, 8 bytes of metadata) sit in a binary trie keyed by
+the bits of the hash, most significant first. A subtree with one entry is
+that entry's leaf, an empty subtree hashes to zero, and
+
+- `leaf = SHA-256(0x00 ‖ hash ‖ metadata)`
+- `node = SHA-256(0x01 ‖ left ‖ right)`
+
+The root depends only on the set of entries, not the order they were added
+in, so anyone holding the database can rebuild it (`hdbtrie root --hdb DIR`)
+and check a published root. The HDB rebuilds the trie whenever it loads its
+database.
+
+**A lookup proof** for a hash follows the path its bits spell out and gives
+the sibling hash at each level. The path ends at an empty subtree (absent),
+at a leaf holding the hash (present, with its metadata), or at a leaf
+holding a different hash that shares the path so far (absent). The verifier
+rehashes up to the root. Hash entries are pseudorandom, so paths are about
+`log₂(entries)` long: 20 levels and roughly 700 bytes at a million entries.
+
+**What it proves.** Against a given root, the HDB cannot report a hash as
+absent when it is present, or the other way round, without breaking
+SHA-256. It does not prove the root is the real database: that is what the
+registry's published roots are for (section 4). Nor does it prove what the
+HDB does with a hit afterwards (exemptions, region rules, consolidating hits
+into hazards): the attested `hazardCount` stays a signed claim, while
+`lookupHits`, the number of screened hashes found in the database, is
+proven. A record with `lookupHits = 0` therefore shows the order matched
+nothing in the published database, whatever the HDB says.
+
+This follows Dan Boneh's suggestion of a Merkle trie. The project's earlier
+plan, a bilinear accumulator (`crates/hdb_acc`, never finished), would have
+needed the accumulator's secret key to be kept from the HDB: whoever holds
+it can forge non-membership proofs.
 
 ## 3. Record circuit and escrow
 
 `zk/programs/record` turns a receipt into the on-chain artifact. It verifies
 the aggregation proof recursively, verifies the HDB's Ed25519 signature on
-the attestation, opens the order commitment against the windows, and
-encrypts every field to the authority committee key. Field 0 is the windows;
+the attestation, checks the screened hashes against the statement's hashes
+digest and verifies a lookup proof for each against the attested root,
+opens the order commitment against the windows, and encrypts every field to
+the authority committee key. Field 0 is the windows;
 fields 1–5 are purpose, lab id, printer id, location and timestamp. Public
 values, ABI-encoded:
 
 `circuitsDigest, statementDigest, orderCommitment, activeSecurityKeyDigest,
-hdbPublicKey, hazardCount, screenedAt, committeeKey, fieldDigests[]`
+hdbPublicKey, hdbRoot, hazardCount, lookupHits, screenedAt, committeeKey,
+fieldDigests[]`
 
 **Escrow** (`crates/zk_escrow`) is hashed ElGamal over Ristretto, per field:
 `R = r·G`, key `= H(r·PK, field)`, `ct = plaintext ⊕ keystream(key)`,
@@ -119,6 +169,11 @@ independently.
 - **Screeners** (pluggable protocols): each registered service pins its HDB
   key, its active-security key digest and its circuits digest. A record must
   match all three.
+- **Database roots**: each screener names a curator, who publishes the roots
+  of its hazard database (`publishHdbRoot`). A record's `hdbRoot` must be a
+  published, unrevoked root of its screener. Every root ever published
+  stays on chain, so every lab and auditor sees the same database versions;
+  governance can revoke a root (`revokeHdbRoot`).
 - **Records**: `submitRecord` verifies the Groth16 record proof with SP1's
   verifier. It then checks the screener pins, the current committee key,
   freshness (`maxRecordAge`), the required field count, each ciphertext's
@@ -140,8 +195,15 @@ independently.
 - **Committee setup** uses a trusted dealer (`zksecuredna committee-deal`).
   A deployment needs a DKG so no party ever holds the full key.
 - **The screening service itself**: the registry trusts registered HDB keys
-  and keyserver keys to belong to an honest service. The proofs show the
-  protocol was followed, not that the hazard database is complete.
+  and keyserver keys to belong to an honest service. Lookups are proven
+  against a published database root, so the HDB can no longer misreport
+  what its database holds; what it does with a hit (exemptions, region
+  rules, the hazard count) is still its signed word.
+- **The database contents**: the curator vouches that a published root is
+  the real database. Anyone holding the database can rebuild the root, and
+  auditors can screen known hazards and expect proven hits, but nothing
+  proves the database is complete, including against novel AI-designed
+  sequences.
 - **Long-term confidentiality**: ciphertexts on a public chain are permanent;
   a future break of the encryption, or a leak of `t` shares, exposes past
   records. Posting frequency and timing are visible even though content is not.

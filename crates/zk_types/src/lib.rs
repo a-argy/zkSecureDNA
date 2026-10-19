@@ -11,6 +11,8 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod trie;
+
 pub type Digest32 = [u8; 32];
 
 /// Public output of the hash circuit.
@@ -176,18 +178,22 @@ pub struct HdbAttestation {
     /// Unix seconds when the HDB screened the order.
     pub timestamp: u64,
     pub hdb_public_key: Digest32,
+    /// Root of the database trie the HDB's lookup proofs are against
+    /// (see [`trie`]).
+    pub hdb_root: Digest32,
 }
 
 impl HdbAttestation {
     /// The exact bytes signed.
     pub fn message(&self) -> Vec<u8> {
-        let mut m = Vec::with_capacity(24 + 32 * 3 + 4 + 8 + 32);
-        m.extend_from_slice(b"zksecuredna/hdb-attestation/v1");
+        let mut m = Vec::with_capacity(30 + 32 * 4 + 4 + 8);
+        m.extend_from_slice(b"zksecuredna/hdb-attestation/v2");
         m.extend_from_slice(&self.statement_digest);
         m.extend_from_slice(&self.hdb_hashes_digest);
         m.extend_from_slice(&self.hazard_count.to_le_bytes());
         m.extend_from_slice(&self.timestamp.to_le_bytes());
         m.extend_from_slice(&self.hdb_public_key);
+        m.extend_from_slice(&self.hdb_root);
         m
     }
 }
@@ -205,6 +211,8 @@ pub struct SignedHdbAttestation {
 pub struct ScreenAndVerifyResponse<R> {
     pub result: R,
     pub attestation: SignedHdbAttestation,
+    /// A lookup proof for every hash screened, against `attestation.hdb_root`.
+    pub lookups: trie::TrieLookups,
 }
 
 /// Everything a lab keeps after a proved screening, to later build the
@@ -219,6 +227,9 @@ pub struct ZkReceipt {
     pub attestation: SignedHdbAttestation,
     /// The screened windows, in order (opens the order commitment).
     pub windows: Vec<Vec<u8>>,
+    /// The exact HDB request body (opens `statement.hdb_hashes_digest`).
+    pub hdb_hashes: Vec<u8>,
+    pub lookups: trie::TrieLookups,
 }
 
 /// `SHA-256` over the three circuit verifying keys a record depends on; the

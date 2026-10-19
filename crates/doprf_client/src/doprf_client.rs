@@ -73,13 +73,16 @@ struct PendingReceipt {
     proof: Vec<u8>,
     salt: zk_types::Digest32,
     windows: Vec<Vec<u8>>,
+    /// The exact bytes posted to the HDB.
+    hdb_hashes: Vec<u8>,
 }
 
 impl PendingReceipt {
-    /// Checks the HDB attested to exactly this statement, with a valid signature.
+    /// Checks the HDB attested to exactly this statement, with a valid
+    /// signature, and proved every lookup against the root it attested to.
     fn into_receipt(
         self,
-        signed: zk_types::SignedHdbAttestation,
+        (signed, lookups): crate::scep_client::HdbProofs,
     ) -> Result<zk_types::ZkReceipt, DoprfError> {
         let bad = |why: &str| DoprfError::ZkError(format!("invalid HDB attestation: {why}"));
         let att = &signed.attestation;
@@ -93,12 +96,21 @@ impl PendingReceipt {
         certificates::PublicKey::from_bytes(att.hdb_public_key)
             .verify(&att.message(), &certificates::Signature::from_bytes(signature))
             .map_err(|_| bad("signature"))?;
+        if lookups.root != att.hdb_root {
+            return Err(bad("lookup proofs are for another database root"));
+        }
+        let hits = lookups
+            .verify(&self.hdb_hashes)
+            .map_err(|e| bad(&format!("lookup proofs: {e:?}")))?;
+        info!("HDB lookup proofs verified: {hits} of {} hashes in the database", lookups.proofs.len());
         Ok(zk_types::ZkReceipt {
             statement: self.statement,
             proof: self.proof,
             salt: self.salt,
             attestation: signed,
             windows: self.windows,
+            hdb_hashes: self.hdb_hashes,
+            lookups,
         })
     }
 }
@@ -411,7 +423,8 @@ impl<'a, S> DoprfClient<'a, S> {
                 .await?;
 
         // The proof must be about the hashes we are about to send.
-        let local_digest = zk_types::hdb_hashes_digest(&zk_types::concat(hashes.iter_encoded()));
+        let hdb_hashes = zk_types::concat(hashes.iter_encoded());
+        let local_digest = zk_types::hdb_hashes_digest(&hdb_hashes);
         if screening.statement.hdb_hashes_digest != local_digest {
             return Err(DoprfError::ZkError(
                 "proof statement does not match locally computed hashes".into(),
@@ -428,6 +441,7 @@ impl<'a, S> DoprfClient<'a, S> {
             proof,
             salt: screening.salt,
             windows: witness.windows,
+            hdb_hashes,
         });
         Ok((hashes, pending))
     }

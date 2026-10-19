@@ -148,25 +148,44 @@ async fn reconfigure(
 
     let zk = if !app_cfg.zk_verify {
         None
-    } else if let Some(zk) = prev_state.as_ref().and_then(|s| s.zk.clone()) {
-        // Verifier setup derives verifying keys from the circuits; reuse on reload.
-        Some(zk)
     } else {
-        // Without a pinned key, a lab could run its own keyservers.
-        let digest = app_cfg.zk_active_security_key_digest.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("--zk-verify requires --zk-active-security-key-digest")
-        })?;
-        let bytes = hex::decode(digest).context("zk active security key digest is not hex")?;
-        let trusted_active_security_key: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("zk active security key digest must be 32 bytes"))?;
-        let verifier = zk_prover::ScreeningVerifier::new()
-            .await
-            .context("setting up zk verifier")?;
-        Some(Arc::new(crate::state::ZkState {
-            verifier,
-            trusted_active_security_key,
-        }))
+        // The trie is rebuilt on every load, so it always matches the
+        // database being served.
+        let started = std::time::Instant::now();
+        let trie = Arc::new(
+            hdb_trie::Trie::load_hdb(&app_cfg.database).context("building database trie")?,
+        );
+        info!(
+            "database trie: {} entries, root {}, built in {:.1}s",
+            trie.len(),
+            hex::encode(trie.root()),
+            started.elapsed().as_secs_f64()
+        );
+        if let Some(zk) = prev_state.as_ref().and_then(|s| s.zk.as_ref()) {
+            // Verifier setup derives verifying keys from the circuits; reuse on reload.
+            Some(Arc::new(crate::state::ZkState {
+                verifier: zk.verifier.clone(),
+                trusted_active_security_key: zk.trusted_active_security_key,
+                trie,
+            }))
+        } else {
+            // Without a pinned key, a lab could run its own keyservers.
+            let digest = app_cfg.zk_active_security_key_digest.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--zk-verify requires --zk-active-security-key-digest")
+            })?;
+            let bytes = hex::decode(digest).context("zk active security key digest is not hex")?;
+            let trusted_active_security_key: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("zk active security key digest must be 32 bytes"))?;
+            let verifier = zk_prover::ScreeningVerifier::new()
+                .await
+                .context("setting up zk verifier")?;
+            Some(Arc::new(crate::state::ZkState {
+                verifier: Arc::new(verifier),
+                trusted_active_security_key,
+                trie,
+            }))
+        }
     };
 
     Ok(Arc::new(HdbServerState {

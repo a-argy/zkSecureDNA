@@ -41,8 +41,10 @@ pub struct HdbServerState {
 }
 
 pub struct ZkState {
-    pub verifier: zk_prover::ScreeningVerifier,
+    pub verifier: Arc<zk_prover::ScreeningVerifier>,
     pub trusted_active_security_key: zk_prover::zk_types::Digest32,
+    /// Merkle trie of the database, for lookup proofs.
+    pub trie: Arc<hdb_trie::Trie>,
 }
 
 impl HdbServerState {

@@ -6,6 +6,8 @@
 //! keyshares, HDB attestation signed with a test Ed25519 key), builds the
 //! Groth16-wrapped record proof, checks every public value, opens one field
 //! with 2 of 3 authority shares, and writes contracts/test/fixtures/record.json.
+//! Also checks (execute only) that the record circuit counts a database hit
+//! and rejects lookup proofs against another root.
 //!
 //!   SP1_PROVER=cpu cargo run --release -p zk_prover --example record_fixture
 
@@ -20,7 +22,9 @@ use doprf::prf::{generate_keyshares, HashPart, KeyShare, QueryStateSet};
 use doprf::tagged::{HashTag, TaggedHash};
 use ed25519_dalek::{Signer, SigningKey};
 use packed_ristretto::PackedRistrettos;
+use hdb_trie::Trie;
 use rand::rngs::OsRng;
+use rand::Rng;
 use zk_escrow::{combine_shares, deal_committee, decode_windows, decryption_share, EncryptedField};
 use zk_prover::{ClientProver, ProofMode, RecordProofKind};
 use zk_types::{concat, HdbAttestation, SignedHdbAttestation, ZkReceipt};
@@ -32,7 +36,9 @@ sol! {
         bytes32 orderCommitment;
         bytes32 activeSecurityKeyDigest;
         bytes32 hdbPublicKey;
+        bytes32 hdbRoot;
         uint32 hazardCount;
+        uint32 lookupHits;
         uint64 screenedAt;
         bytes32 committeeKey;
         bytes32[] fieldDigests;
@@ -43,6 +49,9 @@ const WINDOWS: [&str; 2] = [
     "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC",
     "CGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACG",
 ];
+
+/// Entries in the synthetic hazard database.
+const TEST_DB_ENTRIES: usize = 100_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -101,22 +110,33 @@ async fn main() -> anyhow::Result<()> {
     }
     let packed: PackedRistrettos<TaggedHash> = done.get_hash_values()?.into_iter().collect();
     assert_eq!(screening.statement.hdb_hashes_digest, zk_types::hdb_hashes_digest(&concat(packed.iter_encoded())));
+    let hdb_hashes = concat(packed.iter_encoded());
+    // A synthetic hazard database (random entries) that the order misses.
+    let db: Vec<([u8; 32], [u8; 8])> = (0..TEST_DB_ENTRIES).map(|_| (OsRng.gen(), OsRng.gen())).collect();
+    let trie = Trie::new(db.clone());
     let hdb_key = SigningKey::generate(&mut OsRng);
-    let attestation = HdbAttestation {
-        statement_digest: zk_types::statement_digest(&screening.statement),
-        hdb_hashes_digest: screening.statement.hdb_hashes_digest,
-        hazard_count: 0,
-        timestamp: 1_790_000_000,
-        hdb_public_key: hdb_key.verifying_key().to_bytes(),
+    let make_receipt = |trie: &Trie, hazard_count: u32| {
+        let attestation = HdbAttestation {
+            statement_digest: zk_types::statement_digest(&screening.statement),
+            hdb_hashes_digest: screening.statement.hdb_hashes_digest,
+            hazard_count,
+            timestamp: 1_790_000_000,
+            hdb_public_key: hdb_key.verifying_key().to_bytes(),
+            hdb_root: trie.root(),
+        };
+        let signature = hdb_key.sign(&attestation.message()).to_bytes().to_vec();
+        ZkReceipt {
+            statement: screening.statement.clone(),
+            proof: screening.proof.clone().expect("prove mode"),
+            salt: screening.salt,
+            attestation: SignedHdbAttestation { attestation, signature },
+            windows: witness.windows.clone(),
+            hdb_hashes: hdb_hashes.clone(),
+            lookups: trie.lookups(&hdb_hashes).unwrap(),
+        }
     };
-    let signature = hdb_key.sign(&attestation.message()).to_bytes().to_vec();
-    let receipt = ZkReceipt {
-        statement: screening.statement.clone(),
-        proof: screening.proof.clone().expect("prove mode"),
-        salt: screening.salt,
-        attestation: SignedHdbAttestation { attestation: attestation.clone(), signature },
-        windows: witness.windows.clone(),
-    };
+    let receipt = make_receipt(&trie, 0);
+    let attestation = receipt.attestation.attestation.clone();
 
     if let Ok(path) = std::env::var("RECEIPT_OUT") {
         std::fs::write(&path, serde_json::to_vec(&receipt)?)?;
@@ -127,6 +147,20 @@ async fn main() -> anyhow::Result<()> {
     let (committee_key, authority_shares) = deal_committee(2, 3);
     let committee_bytes = committee_key.compress().to_bytes();
     let metadata = vec![b"plasmid backbone test".to_vec(), b"lab:test-001".to_vec()];
+
+    // The record circuit counts database hits from the lookup proofs: add the
+    // order's first hash to the database and it reports one hit.
+    let mut with_hit = db.clone();
+    with_hit.push((hdb_hashes[4..36].try_into().unwrap(), [0; 8]));
+    let hit_receipt = make_receipt(&Trie::new(with_hit), 1);
+    let hit = prover.prove_record(RecordProofKind::Execute, &hit_receipt, &metadata, &committee_bytes).await?;
+    assert_eq!(RecordPublicValues::abi_decode(&hit.public_values)?.lookupHits, 1);
+    // Lookup proofs against a different root than the one attested are rejected.
+    let mut forged = receipt.clone();
+    forged.lookups = hit_receipt.lookups.clone();
+    assert!(prover.prove_record(RecordProofKind::Execute, &forged, &metadata, &committee_bytes).await.is_err());
+    eprintln!("lookup checks passed (hit counted, foreign root rejected)");
+
     let record = prover.prove_record(kind, &receipt, &metadata, &committee_bytes).await?;
     eprintln!("record proved ({kind:?}): {} cycles, {:.1?}", record.cycles, record.prove_time);
 
@@ -137,7 +171,9 @@ async fn main() -> anyhow::Result<()> {
     assert_eq!(pv.orderCommitment.0, screening.statement.order_commitment);
     assert_eq!(pv.activeSecurityKeyDigest.0, zk_types::active_security_key_digest(&ask.commitment_bytes()));
     assert_eq!(pv.hdbPublicKey.0, attestation.hdb_public_key);
+    assert_eq!(pv.hdbRoot.0, trie.root());
     assert_eq!(pv.hazardCount, 0);
+    assert_eq!(pv.lookupHits, 0);
     assert_eq!(pv.screenedAt, attestation.timestamp);
     assert_eq!(pv.committeeKey.0, committee_bytes);
     assert_eq!(pv.fieldDigests.len(), 3);
@@ -175,6 +211,7 @@ async fn main() -> anyhow::Result<()> {
         "statementDigest": format!("0x{}", hex::encode(pv.statementDigest.0)),
         "activeSecurityKeyDigest": format!("0x{}", hex::encode(pv.activeSecurityKeyDigest.0)),
         "hdbPublicKey": format!("0x{}", hex::encode(pv.hdbPublicKey.0)),
+        "hdbRoot": format!("0x{}", hex::encode(pv.hdbRoot.0)),
         "committeeKey": format!("0x{}", hex::encode(committee_bytes)),
         "screenedAt": pv.screenedAt,
     });

@@ -22,6 +22,10 @@ use scep_client_helpers::{ClientCerts, ScepClient};
 use shared_types::hdb::HdbScreeningResult;
 use shared_types::synthesis_permission::Region;
 
+/// What the HDB returns with a proved screening: its signed attestation, and
+/// a lookup proof for every hash against the database trie.
+pub type HdbProofs = (zk_types::SignedHdbAttestation, zk_types::trie::TrieLookups);
+
 #[derive(Clone)]
 pub struct ClientConfig {
     pub api_client: BaseApiClient,
@@ -84,7 +88,7 @@ impl HdbClient {
         self,
         hashes: &PackedRistrettos<TaggedHash>,
         proof: Option<&[u8]>,
-    ) -> Result<(HdbScreeningResult, Option<zk_types::SignedHdbAttestation>), DoprfError> {
+    ) -> Result<(HdbScreeningResult, Option<HdbProofs>), DoprfError> {
         let hash_total_count = hashes
             .len()
             .try_into()
@@ -106,7 +110,7 @@ impl HdbClient {
                 Ok(match proof {
                     Some(proof) => {
                         let r = self.client.screen_and_verify(hashes, proof).await?;
-                        (r.result, Some(r.attestation))
+                        (r.result, Some((r.attestation, r.lookups)))
                     }
                     None => (self.client.screen(hashes).await?, None),
                 })
@@ -123,7 +127,7 @@ impl HdbClient {
         ets: &[WithOtps<TokenBundle<ExemptionTokenGroup>>],
         et_hashes: PackedRistrettos<CompletedHashValue>,
         proof: Option<&[u8]>,
-    ) -> Result<(HdbScreeningResult, Option<zk_types::SignedHdbAttestation>), DoprfError> {
+    ) -> Result<(HdbScreeningResult, Option<HdbProofs>), DoprfError> {
         let hash_total_count = hashes
             .len()
             .try_into()
@@ -148,7 +152,7 @@ impl HdbClient {
                             .client
                             .screen_with_ets_and_verify(hashes, ets, &et_hashes, proof)
                             .await?;
-                        (r.result, Some(r.attestation))
+                        (r.result, Some((r.attestation, r.lookups)))
                     }
                     None => (self.client.screen_with_ets(hashes, ets, &et_hashes).await?, None),
                 })

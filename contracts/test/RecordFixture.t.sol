@@ -47,12 +47,14 @@ contract RecordFixtureTest is Test {
                         vm.parseJsonBytes32(json, ".hdbPublicKey"),
                         vm.parseJsonBytes32(json, ".activeSecurityKeyDigest"),
                         vm.parseJsonBytes32(json, ".circuitsDigest"),
+                        address(this),
                         true
                     )
                 )
             )
         );
         registry.execute(pid);
+        registry.publishHdbRoot(SCREENER, vm.parseJsonBytes32(json, ".hdbRoot"));
     }
 
     function test_real_record_is_accepted() public {
@@ -60,6 +62,13 @@ contract RecordFixtureTest is Test {
         uint256 id = registry.submitRecord(SCREENER, publicValues, proof, fields);
         emit log_named_uint("submitRecord gas", gasBefore - gasleft());
         assertEq(registry.getRecord(id).fieldDigests.length, fields.length);
+    }
+
+    function test_record_carries_proven_lookups() public {
+        uint256 id = registry.submitRecord(SCREENER, publicValues, proof, fields);
+        ZkSecureDNARegistry.Record memory r = registry.getRecord(id);
+        assertEq(r.hdbRoot, vm.parseJsonBytes32(vm.readFile("test/fixtures/record.json"), ".hdbRoot"));
+        assertEq(r.lookupHits, 0);
     }
 
     function test_tampered_public_values_are_rejected() public {

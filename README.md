@@ -4,7 +4,8 @@
 
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-informational?style=flat-square)](COPYRIGHT.md)
 
-**Verifiable DNA synthesis screening.** zkSecureDNA extends the
+**Verifiable DNA synthesis screening: a safeguard against AI-enabled
+biological misuse.** zkSecureDNA extends the
 [SecureDNA](https://securedna.org) screening protocol with zero-knowledge
 proofs. A synthesis lab gets a compact, publicly checkable record showing it
 screened an order with a registered screening service, following the
@@ -23,24 +24,37 @@ Project concept by Neil Perry. Built on [SP1](https://github.com/succinctlabs/sp
 
 ## Why this matters
 
-SecureDNA keeps both the customer's order and the hazard database secret,
-but it produces no evidence: after screening, only the lab knows it
-screened. A regulator, insurer or the public must either trust the lab or
-audit it in a way that exposes orders or the database. zkSecureDNA gives
-the lab a record anyone can verify, showing it screened the real order with
-the real, registered service, while revealing nothing about the order.
+As AI models get better at biology, a key worry is that they lower the
+expertise needed to misuse it. Model-side safeguards help but are not the
+only line of defence. Whatever a model tells someone, turning a digital
+design into physical DNA still runs through synthesis providers and,
+increasingly, benchtop DNA printers. That makes synthesis screening one of
+the few safeguards that holds regardless of which model, open or closed,
+was involved. It is widely recommended in AI biosecurity discussions for
+exactly that reason.
 
-This is one instance of a general pattern that matters for AI governance as
-well: *proving a safety check was performed, on the real input, by the real
-checker, without handing over the sensitive data involved*. A developer
-might need to show that a required evaluation ran on the deployed model, by
-an approved evaluator, without revealing weights. The recipe is the same:
+A safeguard nobody can check is weak. SecureDNA keeps both the customer's
+order and the hazard database secret, but it produces no evidence: after
+screening, only the lab knows it screened. As desktop printers spread,
+regulators, insurers and the public need a way to confirm screening
+actually happened at each device, without exposing customers' orders or the
+hazard database. zkSecureDNA gives every screened order a record anyone can
+verify. It shows the real order was screened by the real, registered
+service, and reveals nothing about the order. Authorities can open a
+specific record only jointly, and every opening is public.
+
+The same pattern applies to AI governance more broadly: *proving a safety
+check was performed, on the real input, by the real checker, without
+handing over the sensitive data involved*. A developer might need to show
+that a required evaluation ran on the deployed model, by an approved
+evaluator, without revealing weights. The recipe is the same:
 commit to the private input, prove each step against keys the verifier
 pins, have the external checker sign what it saw, and bind it all into one
 artifact that authorities can open only jointly and publicly.
 
 What is still trusted: the screening service's database (the proofs show
-the protocol was followed, not that the database is complete), the
+the protocol was followed, not that the database catches every hazardous
+sequence; improving detection is separate work that this complements), the
 committee setup (trusted dealer for now), and the permanence of encrypted
 records on a public chain. The full argument, including lessons from v1, is
 in the [write-up](docs/WRITEUP.md).

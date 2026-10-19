@@ -1,6 +1,23 @@
 # Making a safety check verifiable without revealing what was checked
 
-*zkSecureDNA: zero-knowledge proofs for DNA synthesis screening*
+*zkSecureDNA: zero-knowledge proofs for DNA synthesis screening, as a
+safeguard against AI-enabled biological misuse*
+
+## Why DNA synthesis, and why now
+
+A central concern about increasingly capable AI is that it could lower the
+expertise needed to cause biological harm. Model-side safeguards (refusals,
+classifiers, evaluations) are essential, but they only cover the models
+that implement them. A complementary defence sits downstream. Whatever
+help someone gets, a digital design only becomes a physical threat once it
+is turned into DNA. That step runs through synthesis providers and,
+increasingly, benchtop DNA printers. Screening at that point works no
+matter which model, open or closed, was involved. This is why synthesis
+screening keeps appearing in AI biosecurity recommendations.
+
+Benchtop printers make the problem harder. Screening moves from a few large
+providers that can be audited to many devices in many labs. Nobody outside
+the lab can tell whether a given device actually screened its orders.
 
 ## The problem
 
@@ -104,15 +121,23 @@ Moving the check into accelerated precompiles is the obvious next optimization.
 ## What is still trusted
 
 - **The screening service.** The proofs show the protocol was followed with
-  the registered service's keys. They do not show the database is complete.
+  the registered service's keys. They do not show the database catches
+  every hazardous sequence, including novel AI-designed ones. Better
+  detection is separate work. This project makes whatever detection exists
+  verifiable, and lets a better screener plug into the same registry.
 - **Committee setup.** The prototype uses a trusted dealer. A deployment
   needs distributed key generation.
 - **Permanence.** Encrypted records on a public chain are permanent, and
   posting patterns are visible even when contents are not.
 
-## Why this matters beyond DNA
+## Why this matters for AI safety
 
-Many proposed AI governance mechanisms have the same shape: a developer
+For biosecurity directly, this makes a key downstream safeguard against
+AI-enabled misuse checkable. A regulator or insurer can require proof of
+screening from every printer, and verify it, without collecting anyone's
+orders.
+
+More broadly, many proposed AI governance mechanisms have the same shape: a developer
 should be able to show that a required evaluation was run, on the model
 actually deployed, by an approved evaluator, without revealing weights or
 proprietary data. The recipe here transfers directly:
